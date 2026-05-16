@@ -27,9 +27,9 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 
 load_dotenv()
 
-resources_path   = "./NRJ-Dev/Include/ProcedureFiles/"
-embeddings_path  = "./NRJ-Dev/Include/Outputs/Embeddings/"
-output_dir       = "./NRJ-Dev/Include/Outputs/Chats/"
+resources_path   = "./Include/ProcedureFiles/"
+embeddings_path  = "./Include/Outputs/Embeddings/"
+output_dir       = "./Include/Outputs/Chats/"
 current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
 filename_prefix  = "ResourcesFile_"  + current_datetime
 checksum_file    = "current_checksum_" + current_datetime
