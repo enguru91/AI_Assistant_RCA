@@ -33,19 +33,19 @@ Everything runs on the user's machine. No data is sent to external services.
 │              Backend Logic Layer                    │
 │              backend/functions_v2.py                │
 │                                                     │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────┐  │
-│  │  Embedding  │  │  Reranking   │  │  LLM Chat │  │
-│  │  Module     │  │  Module      │  │  Module   │  │
-│  └──────┬──────┘  └──────┬───────┘  └─────┬─────┘  │
+│  ┌─────────────┐  ┌──────────────┐  ┌───────────┐   │
+│  │  Embedding  │  │  Reranking   │  │  LLM Chat │   │
+│  │  Module     │  │  Module      │  │  Module   │   │
+│  └──────┬──────┘  └──────┬───────┘  └─────┬─────┘   │
 └─────────┼────────────────┼────────────────┼─────────┘
           │                │                │
           ▼                ▼                ▼
-┌──────────────────┐  ┌──────────┐  ┌─────────────────┐
-│ sentence-        │  │ sentence-│  │ Ollama Server   │
-│ transformers     │  │ transform│  │ localhost:11434  │
-│ BAAI/bge-small   │  │ CrossEnc │  │                 │
-│ (local, CPU)     │  │ (local)  │  │ llama3.1:8b     │
-└──────────────────┘  └──────────┘  │ mistral:latest  │
+┌──────────────────┐  ┌──────────┐   ┌─────────────────┐
+│ sentence-        │  │ sentence-│   │ Ollama Server   │
+│ transformers     │  │ transform│   │ localhost:11434 │
+│ BAAI/bge-small   │  │ CrossEnc │   │                 │
+│ (local, CPU)     │  │ (local)  │   │ llama3.1:8b     │
+└──────────────────┘  └──────────┘   │ mistral:latest  │
                                      │ qwen2.5:7b      │
                                      │ phi4:latest     │
                                      └─────────────────┘
