@@ -1,0 +1,6 @@
+streamlit==1.57.0
+python-dotenv==1.2.2
+numpy==2.4.5
+scikit-learn==1.8.0
+sentence-transformers==5.5.0
+openai==2.37.0
