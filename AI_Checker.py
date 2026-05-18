@@ -7,15 +7,21 @@
 #              — WARNING state: warning shown, user must tick "I understand" checkbox to proceed
 #              — OK state: space metrics shown, install proceeds normally
 #              — Added "Uninstall a model" expander with at-least-one-model guard -> Date: 2026-05-18
-# Changes from v2:
-#   - llm_chat()
-#   - Ollama connection status indicator
-#   - Updated model dropdown           → Ollama model names
-#   - Updated LLM response handling    → response is now a plain string, not a dict
-#   - Model dropdown now populated dynamically via list_ollama_models()
-#   - Added "Install a model" expander with Yes/No confirmation flow
-#   - Added install_ollama_model() import
-#   - Added KNOWN_OLLAMA_MODELS import for the install catalogue
+# Version: 3.2 — Extended upload support: txt, csv, md, xml, json, pptx, xlsx, docx, pdf
+#              — Pre-flight file validation gate (size + type + magic bytes) shown in UI
+#              — Per-file extraction warnings surfaced after processing
+#              — Batch size indicator rendered below the uploader
+#              -> Date: 2026-05-18
+#
+# Changes from v3.1:
+#   - st.file_uploader type list expanded to all 9 supported formats
+#   - Uploader label updated to reflect new types and size limits
+#   - validate_uploaded_files() called before check_for_uploaded_files();
+#     all errors displayed together — processing is blocked until resolved
+#   - check_for_uploaded_files() now returns a 3-tuple (texts, vectors, warnings);
+#     extraction warnings rendered as st.warning() items after processing
+#   - Batch size progress bar shown below the uploader for immediate feedback
+#   - MAX_SINGLE_FILE_MB / MAX_BATCH_MB / ALLOWED_EXTENSIONS imported for display
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -37,8 +43,12 @@ from backend.Functions import (
     install_ollama_model,
     uninstall_ollama_model,
     check_disk_space,
+    validate_uploaded_files,
     KNOWN_OLLAMA_MODELS,
     MODEL_SIZES_GB,
+    MAX_SINGLE_FILE_MB,
+    MAX_BATCH_MB,
+    ALLOWED_EXTENSIONS,
 )
 
 # ---------------------------------------------------------------------------
@@ -49,22 +59,22 @@ load_dotenv()
 delete_remaining_resources()  # Clean up any leftover files from the previous session
 
 # Session state defaults
-if "chat_history"    not in st.session_state:
-    st.session_state["chat_history"]    = []
-if "texts"           not in st.session_state:
-    st.session_state["texts"]           = []
-if "vectors"         not in st.session_state:
-    st.session_state["vectors"]         = np.array([])
-if "upload_success"  not in st.session_state:
-    st.session_state["upload_success"]  = False
+if "chat_history"     not in st.session_state:
+    st.session_state["chat_history"]     = []
+if "texts"            not in st.session_state:
+    st.session_state["texts"]            = []
+if "vectors"          not in st.session_state:
+    st.session_state["vectors"]          = np.array([])
+if "upload_success"   not in st.session_state:
+    st.session_state["upload_success"]   = False
 if "installed_models" not in st.session_state:
     st.session_state["installed_models"] = []
-if "confirm_install" not in st.session_state:
-    st.session_state["confirm_install"] = False
+if "confirm_install"  not in st.session_state:
+    st.session_state["confirm_install"]  = False
 if "model_to_install" not in st.session_state:
     st.session_state["model_to_install"] = ""
-if "confirm_uninstall" not in st.session_state:
-    st.session_state["confirm_uninstall"] = False
+if "confirm_uninstall"  not in st.session_state:
+    st.session_state["confirm_uninstall"]  = False
 if "model_to_uninstall" not in st.session_state:
     st.session_state["model_to_uninstall"] = ""
 
@@ -93,8 +103,6 @@ else:
 # Dynamic model selection
 # ---------------------------------------------------------------------------
 
-# Fetch installed models from Ollama on every page load.
-# This reflects the real state — if the user just installed a model, it appears immediately.
 installed_models = list_ollama_models()
 st.session_state["installed_models"] = installed_models
 
@@ -122,7 +130,6 @@ with st.expander("Install a model"):
         "Disk space on the Ollama models drive is checked automatically before downloading."
     )
 
-    # Only models not yet installed appear in this list
     not_installed = {
         label: pull_name
         for label, pull_name in KNOWN_OLLAMA_MODELS.items()
@@ -132,31 +139,26 @@ with st.expander("Install a model"):
     if not not_installed:
         st.success("All catalogue models are already installed.")
     else:
-        selected_label = st.selectbox(
+        selected_label     = st.selectbox(
             "Choose a model to install",
             options=list(not_installed.keys()),
             key="install_model_select",
         )
         selected_pull_name = not_installed[selected_label]
 
-        # ── Disk space check ──────────────────────────────────────────────
         space = check_disk_space(selected_pull_name)
 
-        # Always show the three space metrics for full transparency
         m1, m2, m3 = st.columns(3)
-        m1.metric("Required",         f"{space['required_gb']:.1f} GB")
-        m2.metric("Free on drive",    f"{space['free_gb']:.1f} GB")
-        m3.metric("Remaining after",  f"{space['remaining_pct']:.1f} %")
+        m1.metric("Required",        f"{space['required_gb']:.1f} GB")
+        m2.metric("Free on drive",   f"{space['free_gb']:.1f} GB")
+        m3.metric("Remaining after", f"{space['remaining_pct']:.1f} %")
 
-        # ── BLOCKED — not enough space ────────────────────────────────────
         if not space["can_install"]:
             st.error(
                 f"**Cannot install — insufficient disk space.**\n\n"
                 f"{space['message']}"
             )
-            # Install buttons are intentionally NOT rendered here
 
-        # ── WARNING — install fits but ≤ 10 % will remain ─────────────────
         elif space["warning"]:
             st.warning(
                 f"**Low disk space warning.**\n\n"
@@ -181,7 +183,6 @@ with st.expander("Install a model"):
                     st.session_state["model_to_install"] = ""
                     st.info("Installation cancelled.")
 
-        # ── OK — sufficient space ─────────────────────────────────────────
         else:
             st.success(space["message"])
             col_yes, col_no = st.columns([1, 5])
@@ -198,7 +199,6 @@ with st.expander("Install a model"):
                 st.session_state["model_to_install"] = ""
                 st.info("Installation cancelled.")
 
-        # ── Execute download (shared by WARNING-acknowledged + OK paths) ──
         if (
             st.session_state.get("confirm_install")
             and st.session_state.get("model_to_install") == selected_pull_name
@@ -213,9 +213,7 @@ with st.expander("Install a model"):
             st.session_state["model_to_install"] = ""
 
             if success:
-                st.success(
-                    f"**'{selected_pull_name}' installed successfully.** "
-                )
+                st.success(f"**'{selected_pull_name}' installed successfully.**")
                 time.sleep(1)
                 st.rerun()
             else:
@@ -227,11 +225,9 @@ with st.expander("Install a model"):
 
 with st.expander("Uninstall a model"):
 
-    # ── Guard: block if no models installed ──────────────────────────────
     if len(installed_models) == 0:
         st.info("No models are installed yet.")
 
-    # ── Guard: block if only one model remains ────────────────────────────
     elif len(installed_models) == 1:
         st.error(
             f"**Cannot uninstall '{installed_models[0]}'** — "
@@ -239,7 +235,6 @@ with st.expander("Uninstall a model"):
             "Install a second model first, then you can remove this one."
         )
 
-    # ── Safe to uninstall — two or more models present ────────────────────
     else:
         st.write(
             "Select the model you want to remove. "
@@ -253,7 +248,6 @@ with st.expander("Uninstall a model"):
             key="uninstall_select",
         )
 
-        # Show how much space will be recovered
         recover_gb = MODEL_SIZES_GB.get(model_to_remove)
         if recover_gb:
             st.info(
@@ -286,7 +280,6 @@ with st.expander("Uninstall a model"):
             st.session_state["model_to_uninstall"] = ""
             st.info("Uninstall cancelled.")
 
-        # ── Execute removal ───────────────────────────────────────────────
         if (
             st.session_state.get("confirm_uninstall")
             and st.session_state.get("model_to_uninstall") == model_to_remove
@@ -298,9 +291,7 @@ with st.expander("Uninstall a model"):
             st.session_state["model_to_uninstall"] = ""
 
             if success:
-                st.success(                                  
-                    f"**'{model_to_remove}' has been uninstalled.** "
-                )
+                st.success(f"**'{model_to_remove}' has been uninstalled.**")
                 time.sleep(1)
                 st.rerun()
             else:
@@ -313,25 +304,52 @@ with st.expander("Uninstall a model"):
 user_input = st.text_area("Enter your prompt here:", key="user_input")
 
 # ---------------------------------------------------------------------------
-# Layout — three columns
+# Layout — three columns: Ask AI | File uploader | Export / New Chat
 # ---------------------------------------------------------------------------
 
 col_left, col_middle, col_right = st.columns([1, 2, 1])
 
+# Build a user-friendly label listing all accepted types and size limits
+_ext_display = ", ".join(
+    f".{e}" for e in sorted(ALLOWED_EXTENSIONS)
+)
+_uploader_label = (
+    f"Supported files ({_ext_display}) — "
+    f"max {MAX_SINGLE_FILE_MB} MB per file, {MAX_BATCH_MB} MB total"
+)
+
 with col_middle:
     uploaded_files = st.file_uploader(
-        "Upload reference files (TXT or CSV, max 200 MB each)",
-        type=["txt", "csv"],
+        _uploader_label,
+        type=sorted(ALLOWED_EXTENSIONS),
         accept_multiple_files=True,
         key=st.session_state.get("uploader_key", "default_uploader"),
     )
+
+    # ── Batch size progress bar (immediate visual feedback) ───────────────
+    if uploaded_files:
+        total_bytes = sum(f.size for f in uploaded_files)
+        total_mb    = total_bytes / (1024 ** 2)
+        batch_pct   = min(total_mb / MAX_BATCH_MB, 1.0)  # Clamp to 1.0 for the bar
+
+        st.caption(
+            f"Batch size: {total_mb:.1f} MB / {MAX_BATCH_MB} MB "
+            f"({len(uploaded_files)} file{'s' if len(uploaded_files) != 1 else ''})"
+        )
+        st.progress(
+            batch_pct,
+            text=f"{'⚠️ Batch limit exceeded!' if total_mb > MAX_BATCH_MB else 'Batch size OK'}",
+        )
 
 with col_left:
     chat_button = st.button("Ask AI", disabled=(not ollama_ok or model_choice is None))
 
 with col_right:
-    has_history  = len(st.session_state["chat_history"]) > 0
-    print_button = st.button("Export Chat", disabled=not has_history)
+    has_history = len(st.session_state["chat_history"]) > 0
+    if has_history:
+        print_button = st.button("Export Chat")
+    else:
+        print_button = False
     new_chat_button = st.button("New Chat")
 
 # ---------------------------------------------------------------------------
@@ -386,7 +404,6 @@ def handle_llm_response(response):
         handle_timeout()
         return
 
-    # llm_chat() returns a plain string — check for error prefix
     if isinstance(response, str) and response.startswith("An error occurred"):
         st.error(response)
         return
@@ -402,15 +419,11 @@ def handle_llm_response(response):
 # Core query processing
 # ---------------------------------------------------------------------------
 
-def process_user_input(
-    query   = None,
-    texts   = None,
-    vectors = None,
-):
+def process_user_input(query=None, texts=None, vectors=None):
     """
     Handle a single user query:
       1. Append the question to chat history.
-      2. If uploaded documents exist, rerank them and inject the top results as context.
+      2. If uploaded documents exist, rerank them and inject top results as context.
       3. Call the LLM and display the response.
     """
     query   = query   or user_input
@@ -447,17 +460,13 @@ def process_user_input(
                     },
                 ]
             else:
-                # Reranker returned nothing useful — fall back to LLM-only
-                st.warning("No strongly relevant sections found in your documents. Answering from model knowledge.")
+                st.warning(
+                    "No strongly relevant sections found in your documents. "
+                    "Answering from model knowledge."
+                )
                 prompt_messages = [
-                    {
-                        "role":    "system",
-                        "content": "You are a knowledgeable assistant.",
-                    },
-                    {
-                        "role":    "user",
-                        "content": f"Question: {query}",
-                    },
+                    {"role": "system", "content": "You are a knowledgeable assistant."},
+                    {"role": "user",   "content": f"Question: {query}"},
                 ]
 
             st.info("Generating response...")
@@ -478,14 +487,8 @@ def process_user_input(
         try:
             st.info("No documents uploaded — querying the model directly.")
             prompt_messages = [
-                {
-                    "role":    "system",
-                    "content": "You are a knowledgeable assistant.",
-                },
-                {
-                    "role":    "user",
-                    "content": f"Question: {query}",
-                },
+                {"role": "system", "content": "You are a knowledgeable assistant."},
+                {"role": "user",   "content": f"Question: {query}"},
             ]
             response = get_llm_response_with_timeout(
                 llm_chat,
@@ -500,32 +503,68 @@ def process_user_input(
             st.error(f"An error occurred while querying the model: {ex}")
 
 # ---------------------------------------------------------------------------
-# File upload handling
+# File upload handling — validation gate → processing → warning display
 # ---------------------------------------------------------------------------
 
 if uploaded_files:
     try:
-        with st.spinner("Processing uploaded files and creating embeddings..."):
-            upload_result = check_for_uploaded_files(uploaded_files)
+        # ── Pre-flight validation (size, type, magic bytes) ───────────────
+        # All errors are collected and shown together so the user can fix
+        # everything at once rather than discovering issues one by one.
+        validation_errors = validate_uploaded_files(uploaded_files)
 
-        if upload_result:
-            texts, vectors = upload_result
-            st.session_state["texts"]          = texts
-            st.session_state["vectors"]        = vectors
-            st.session_state["upload_success"] = True
+        if validation_errors:
+            st.error(
+                f"**{len(validation_errors)} validation error(s) found — "
+                "files not processed. Please fix the issues below and re-upload.**"
+            )
+            for err in validation_errors:
+                st.error(err)
+
         else:
-            # Embeddings may already be cached — try loading from file
-            cached = load_embeddings_from_file()
-            if cached:
-                st.session_state["texts"],   \
-                st.session_state["vectors"] = cached
+            # ── Processing ────────────────────────────────────────────────
+            with st.spinner(
+                "Extracting text and creating embeddings — "
+                "this may take a moment for large or complex files..."
+            ):
+                upload_result = check_for_uploaded_files(uploaded_files)
+
+            if upload_result:
+                # check_for_uploaded_files now returns a 3-tuple
+                texts, vectors, extraction_warnings = upload_result
+
+                # Surface any per-file extraction warnings (e.g. skipped files)
+                for warn in extraction_warnings:
+                    st.warning(warn)
+
+                if texts:
+                    st.session_state["texts"]          = texts
+                    st.session_state["vectors"]        = vectors
+                    st.session_state["upload_success"] = True
+                else:
+                    # All files were skipped during extraction
+                    st.warning(
+                        "No text could be extracted from any of the uploaded files. "
+                        "Please check the warnings above and try again."
+                    )
+            else:
+                # Embeddings may already be cached — try loading from file
+                cached = load_embeddings_from_file()
+                if cached:
+                    st.session_state["texts"],   \
+                    st.session_state["vectors"] = cached
+
     except Exception as ex:
         st.error(f"An error occurred while uploading files: {ex}")
+
 else:
     st.info("No files uploaded yet. You can still ask the model questions directly.")
 
 if st.session_state.get("upload_success", False):
-    st.success("Files uploaded and embeddings ready.")
+    n_docs = len(st.session_state.get("texts", []))
+    st.success(
+        f"Files processed — {n_docs} document chunk(s) embedded and ready for querying."
+    )
 
 # ---------------------------------------------------------------------------
 # Chat export
@@ -537,6 +576,9 @@ def save_chat():
         output_path = generate_output_file(st.session_state["chat_history"])
         if output_path:
             st.success(f"Chat history saved to: {output_path}")
+            folder_path = os.path.dirname(output_path)
+            absolute_folder_path = os.path.abspath(folder_path)
+            os.startfile(absolute_folder_path)
         else:
             st.error("Chat history is empty — nothing to export.")
     except Exception as ex:
@@ -554,8 +596,8 @@ if print_button:
 
 if new_chat_button:
     st.session_state.clear()
-    st.session_state["uploader_key"]   = str(time.time())
-    st.session_state["user_input"]     = ""
+    st.session_state["uploader_key"] = str(time.time())
+    st.session_state["user_input"]   = ""
     st.info("Session cleared — ready for a new chat.")
     time.sleep(1)
     st.rerun()

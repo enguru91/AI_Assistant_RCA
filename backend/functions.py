@@ -1,21 +1,28 @@
 # Author: Eshan Gurusinghe
 # Email: engurusinghe91@gmail.com
 # Version: 3.0 — Migrated from Ericsson ELI API to local Ollama stack -> Date: 2026-05-17
-# Version: 3.1 — Added dynamic Ollama model listing and model installation/uninstallation
+# Version: 3.1 — Dynamic model selector and model installation/uninstallation
 #              — Added disk space validation before installation -> Date: 2026-05-18
-# Changes from v2:
-#   - Removed all Ericsson ELI API dependencies (eli package, ELIClient, eli-key)
-#   - create_embeddings_local()  using sentence-transformers
-#   - local_score_rank()         using CrossEncoder
-#   - llm_chat()                 using Ollama via OpenAI SDK
-#   - Added check_ollama_connection() for GUI health status
-#   - Added KNOWN_OLLAMA_MODELS     — curated catalogue of popular installable models
-#   - Added MODEL_SIZES_GB          — exact GB sizes for every catalogue model
-#   - Added check_disk_space()      — validates free disk space before install;
-#                                     blocks on insufficient space, warns at ≤10% remaining
-#   - Added uninstall_ollama_model() — runs `ollama rm <model>` via subprocess
+# Version: 3.2 — Extended upload support: txt, csv, md, xml, json, pptx, xlsx, docx, pdf
+#              — Added file validation layer: per-file 200 MB cap, 400 MB batch cap
+#              — Added magic-bytes content sniffing for binary formats
+#              — Added extract_text_from_file() dispatcher (all 9 formats)
+#              — save_uploaded_files() now extracts text; raw bytes are never stored
+#              — check_for_uploaded_files() returns per-file extraction warnings
+#              — Updated delete_remaining_resources() to cover new resource extensions
+#              -> Date: 2026-05-18
+#
+# New runtime dependencies (add to requirements.txt):
+#   pypdf>=4.0          — PDF text extraction
+#   python-docx>=1.1    — DOCX text extraction
+#   python-pptx>=0.6    — PPTX text extraction
+#   openpyxl>=3.1       — XLSX text extraction
+#   (sentence-transformers, openai, streamlit, python-dotenv — unchanged)
 
 import os
+import io
+import csv
+import json
 import pickle
 import glob
 import hashlib
@@ -27,6 +34,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer, CrossEncoder
+import xml.etree.ElementTree as ET
 
 # ---------------------------------------------------------------------------
 # Environment & path constants
@@ -45,6 +53,326 @@ checksum_file    = "current_checksum_" + current_datetime
 os.makedirs(resources_path,  exist_ok=True)
 os.makedirs(embeddings_path, exist_ok=True)
 os.makedirs(output_dir,      exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# File upload — validation constants
+# ---------------------------------------------------------------------------
+
+# Hard size limits
+MAX_SINGLE_FILE_MB: int = 100
+MAX_BATCH_MB:       int = 200
+MAX_SINGLE_FILE_B:  int = MAX_SINGLE_FILE_MB * 1024 * 1024
+MAX_BATCH_B:        int = MAX_BATCH_MB        * 1024 * 1024
+
+# Canonical set of accepted extensions (lower-case, no leading dot)
+ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
+    "txt", "csv", "md",
+    "xml", "json",
+    "pptx",                 # OOXML PowerPoint — legacy .ppt is not supported
+    "xlsx",                 # OOXML Excel
+    "docx",                 # OOXML Word
+    "pdf",
+})
+
+# Magic-byte signatures used for content-sniffing of binary formats.
+# Keys are byte prefixes (first 8 bytes); values are the expected extension group.
+_MAGIC_BYTES: dict[bytes, str] = {
+    b"%PDF":      "pdf",
+    b"PK\x03\x04": "ooxml",   # All three OOXML formats (docx/xlsx/pptx) are ZIP archives
+}
+
+_OOXML_EXTENSIONS: frozenset[str] = frozenset({"docx", "xlsx", "pptx"})
+
+# ---------------------------------------------------------------------------
+# File upload — validation
+# ---------------------------------------------------------------------------
+
+def validate_uploaded_files(uploaded_files) -> list[str]:
+    """
+    Validate a list of Streamlit UploadedFile objects before any processing.
+
+    Checks performed (in order):
+      1. Extension is in ALLOWED_EXTENSIONS.
+      2. Individual file size does not exceed MAX_SINGLE_FILE_MB.
+      3. Magic bytes match the declared extension (binary formats only).
+      4. Aggregate batch size does not exceed MAX_BATCH_MB.
+
+    Parameters
+    ----------
+    uploaded_files : list[UploadedFile]
+        Files returned by st.file_uploader().
+
+    Returns
+    -------
+    list[str]
+        Human-readable error strings. An empty list means all files are valid.
+    """
+    errors: list[str] = []
+    total_bytes: int = 0
+
+    for f in uploaded_files:
+        name = f.name
+        ext  = os.path.splitext(name)[1].lstrip(".").lower()
+        size = f.size   # Streamlit always exposes .size
+
+        # ── 1. Extension whitelist ────────────────────────────────────────
+        if ext not in ALLOWED_EXTENSIONS:
+            errors.append(
+                f"❌ '{name}': unsupported file type '.{ext}'. "
+                f"Accepted types: {', '.join(sorted(ALLOWED_EXTENSIONS))}."
+            )
+            continue  # No point in further checks for this file
+
+        # ── 2. Individual size cap ────────────────────────────────────────
+        if size > MAX_SINGLE_FILE_B:
+            size_mb = size / (1024 ** 2)
+            errors.append(
+                f"❌ '{name}': file size {size_mb:.1f} MB exceeds the "
+                f"{MAX_SINGLE_FILE_MB} MB per-file limit."
+            )
+
+        # ── 3. Magic-byte content sniffing (binary formats only) ──────────
+        if ext in _OOXML_EXTENSIONS or ext == "pdf":
+            header = f.read(8)
+            f.seek(0)   # Always reset the stream pointer after peeking
+
+            if ext == "pdf":
+                if not header.startswith(b"%PDF"):
+                    errors.append(
+                        f"❌ '{name}': file does not start with a valid PDF signature. "
+                        "It may be corrupt or misnamed."
+                    )
+            elif ext in _OOXML_EXTENSIONS:
+                if not header.startswith(b"PK\x03\x04"):
+                    errors.append(
+                        f"❌ '{name}': file does not appear to be a valid Office Open XML "
+                        f"file (expected ZIP/OOXML signature). It may be corrupt, "
+                        f"or a legacy binary format (e.g. .ppt / .xls / .doc) renamed "
+                        f"with a modern extension. Please re-save as .{ext} first."
+                    )
+        else:
+            # For text-based formats reset is not needed, but do it for safety
+            f.seek(0)
+
+        total_bytes += size
+
+    # ── 4. Batch size cap ─────────────────────────────────────────────────
+    if total_bytes > MAX_BATCH_B:
+        total_mb = total_bytes / (1024 ** 2)
+        errors.append(
+            f"❌ Total batch size {total_mb:.1f} MB exceeds the {MAX_BATCH_MB} MB "
+            f"batch limit. Remove some files and try again."
+        )
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# File upload — text extraction
+# ---------------------------------------------------------------------------
+
+def extract_text_from_file(uploaded_file) -> str:
+    """
+    Extract all readable text from an UploadedFile object.
+
+    Supported formats
+    -----------------
+    txt, md  — UTF-8 decode (BOM-aware, errors replaced)
+    csv      — Rows joined as comma-separated strings
+    json     — Pretty-printed JSON tree (validates structure)
+    xml      — All element text nodes concatenated
+    xlsx     — All sheets, rows as tab-separated strings
+    docx     — Paragraphs + table cells
+    pptx     — All slide text shapes, labelled by slide number
+    pdf      — Page text via pypdf (text-layer PDFs only)
+
+    Parameters
+    ----------
+    uploaded_file : UploadedFile
+        A Streamlit UploadedFile whose stream is positioned at the start.
+
+    Returns
+    -------
+    str
+        Extracted text content.
+
+    Raises
+    ------
+    ValueError
+        If the file content cannot be parsed or a required library is missing.
+    """
+    name = uploaded_file.name
+    ext  = os.path.splitext(name)[1].lstrip(".").lower()
+    raw  = uploaded_file.read()
+    uploaded_file.seek(0)  # Reset so callers can re-read if needed
+
+    # ── Plain text ─────────────────────────────────────────────────────────
+    if ext in ("txt", "md"):
+        # Strip UTF-8 BOM if present
+        return raw.decode("utf-8-sig", errors="replace")
+
+    # ── CSV ────────────────────────────────────────────────────────────────
+    if ext == "csv":
+        text_io = io.StringIO(raw.decode("utf-8-sig", errors="replace"))
+        reader  = csv.reader(text_io)
+        rows    = [", ".join(cell.strip() for cell in row) for row in reader if any(row)]
+        return "\n".join(rows)
+
+    # ── JSON ───────────────────────────────────────────────────────────────
+    if ext == "json":
+        try:
+            data = json.loads(raw.decode("utf-8-sig", errors="replace"))
+            return json.dumps(data, indent=2, ensure_ascii=False)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in '{name}': {exc}") from exc
+
+    # ── XML ────────────────────────────────────────────────────────────────
+    if ext == "xml":
+        try:
+            root = ET.fromstring(raw)
+            parts: list[str] = []
+            for elem in root.iter():
+                if elem.text  and elem.text.strip():
+                    parts.append(elem.text.strip())
+                if elem.tail and elem.tail.strip():
+                    parts.append(elem.tail.strip())
+            if not parts:
+                raise ValueError(f"No text content found in XML file '{name}'.")
+            return "\n".join(parts)
+        except ET.ParseError as exc:
+            raise ValueError(f"Malformed XML in '{name}': {exc}") from exc
+
+    # ── PDF ────────────────────────────────────────────────────────────────
+    if ext == "pdf":
+        try:
+            import pypdf
+        except ImportError as exc:
+            raise ValueError(
+                "pypdf is not installed. Run: pip install 'pypdf>=4.0'"
+            ) from exc
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(raw))
+            if reader.is_encrypted:
+                raise ValueError(
+                    f"PDF '{name}' is password-protected. "
+                    "Please decrypt it before uploading."
+                )
+            pages = [page.extract_text() or "" for page in reader.pages]
+            text  = "\n\n".join(p.strip() for p in pages if p.strip())
+            if not text:
+                raise ValueError(
+                    f"No extractable text found in '{name}'. "
+                    "The PDF may be image-only (scanned). "
+                    "Please use a PDF with a text layer, or run OCR first."
+                )
+            return text
+        except pypdf.errors.PdfReadError as exc:
+            raise ValueError(f"Could not read PDF '{name}': {exc}") from exc
+
+    # ── DOCX ───────────────────────────────────────────────────────────────
+    if ext == "docx":
+        try:
+            import docx as python_docx
+        except ImportError as exc:
+            raise ValueError(
+                "python-docx is not installed. Run: pip install 'python-docx>=1.1'"
+            ) from exc
+        try:
+            doc   = python_docx.Document(io.BytesIO(raw))
+            parts = []
+
+            # Body paragraphs
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    parts.append(para.text.strip())
+
+            # Tables (each row as pipe-delimited)
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = " | ".join(
+                        cell.text.strip() for cell in row.cells
+                    )
+                    if row_text.strip():
+                        parts.append(row_text)
+
+            if not parts:
+                raise ValueError(f"No readable text found in DOCX '{name}'.")
+            return "\n".join(parts)
+        except Exception as exc:
+            raise ValueError(f"Could not read DOCX '{name}': {exc}") from exc
+
+    # ── XLSX ───────────────────────────────────────────────────────────────
+    if ext == "xlsx":
+        try:
+            import openpyxl
+        except ImportError as exc:
+            raise ValueError(
+                "openpyxl is not installed. Run: pip install 'openpyxl>=3.1'"
+            ) from exc
+        try:
+            wb    = openpyxl.load_workbook(
+                io.BytesIO(raw), read_only=True, data_only=True
+            )
+            parts = []
+            for sheet in wb.worksheets:
+                parts.append(f"[Sheet: {sheet.title}]")
+                for row in sheet.iter_rows(values_only=True):
+                    row_text = "\t".join(
+                        str(cell) if cell is not None else "" for cell in row
+                    )
+                    if row_text.strip():
+                        parts.append(row_text)
+            wb.close()
+
+            if not parts:
+                raise ValueError(f"No data found in XLSX '{name}'.")
+            return "\n".join(parts)
+        except Exception as exc:
+            raise ValueError(f"Could not read XLSX '{name}': {exc}") from exc
+
+    # ── PPTX ───────────────────────────────────────────────────────────────
+    if ext == "pptx":
+        try:
+            from pptx import Presentation
+        except ImportError as exc:
+            raise ValueError(
+                "python-pptx is not installed. Run: pip install 'python-pptx>=0.6'"
+            ) from exc
+        try:
+            prs    = Presentation(io.BytesIO(raw))
+            slides = []
+            for idx, slide in enumerate(prs.slides, start=1):
+                texts = []
+                for shape in slide.shapes:
+                    # Text frames (title, body, text boxes)
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            line = "".join(run.text for run in para.runs).strip()
+                            if line:
+                                texts.append(line)
+                    # Tables inside slides
+                    if shape.has_table:
+                        for row in shape.table.rows:
+                            row_text = " | ".join(
+                                cell.text.strip() for cell in row.cells
+                            )
+                            if row_text.strip():
+                                texts.append(row_text)
+                if texts:
+                    slides.append(f"[Slide {idx}]\n" + "\n".join(texts))
+
+            if not slides:
+                raise ValueError(f"No readable text found in PPTX '{name}'.")
+            return "\n\n".join(slides)
+        except Exception as exc:
+            raise ValueError(f"Could not read PPTX '{name}': {exc}") from exc
+
+    # ── Fallback (should never reach here after extension validation) ──────
+    raise ValueError(
+        f"No extractor available for '.{ext}'. "
+        f"Supported types: {', '.join(sorted(ALLOWED_EXTENSIONS))}."
+    )
+
 
 # ---------------------------------------------------------------------------
 # Local model initialisation
@@ -79,7 +407,7 @@ def check_ollama_connection():
     Returns (True, [model_names]) on success, or (False, error_message) on failure.
     """
     try:
-        models = ollama_client.models.list()
+        models      = ollama_client.models.list()
         model_names = [m.id for m in models.data]
         print(f"Ollama connected. Available models: {model_names}")
         return True, model_names
@@ -93,14 +421,7 @@ def check_ollama_connection():
 
 # A curated list of popular, publicly available Ollama models.
 # Format: {"display_label": "ollama_pull_name"}
-# This is used to populate the "Install a model" dropdown in the UI.
 # Models the user already has installed are filtered out dynamically.
-
-# A curated list of popular, publicly available Ollama models.
-# Format: {"display_label": "ollama_pull_name"}
-# This is used to populate the "Install a model" dropdown in the UI.
-# Models the user already has installed are filtered out dynamically.
-
 KNOWN_OLLAMA_MODELS = {
     # ── Small & fast (good for CPU-only machines) ──────────────────────────
     "LLaMA 3.1 8B  (~4.7 GB)":    "llama3.1:8b",
@@ -126,7 +447,6 @@ KNOWN_OLLAMA_MODELS = {
 
 # Approximate download sizes in GB for each model in the catalogue above.
 # Used by check_disk_space() to validate free space before starting a download.
-# Values are rounded conservatively upward to account for temporary extraction space.
 MODEL_SIZES_GB = {
     "llama3.1:8b":          4.7,
     "llama3.2:3b":          2.0,
@@ -151,7 +471,7 @@ MODEL_SIZES_GB = {
 # Dynamic Ollama model listing
 # ---------------------------------------------------------------------------
 
-def list_ollama_models():
+def list_ollama_models() -> list[str]:
     """
     Fetch the names of all models currently installed in Ollama.
 
@@ -174,19 +494,12 @@ def list_ollama_models():
 # Ollama model installation
 # ---------------------------------------------------------------------------
 
-def install_ollama_model(model_name):
+def install_ollama_model(model_name: str) -> tuple[bool, str]:
     """
     Pull (download and install) an Ollama model by running:
         ollama pull <model_name>
 
     This is a blocking call — it waits until the download completes.
-    Model files are stored in the directory set by the OLLAMA_MODELS
-    environment variable (defaults to C:\\Users\\<user>\\.ollama\\models).
-
-    Parameters
-    ----------
-    model_name : str
-        The Ollama model identifier, e.g. "llama3.1:8b" or "mistral:latest".
 
     Returns
     -------
@@ -227,7 +540,7 @@ def install_ollama_model(model_name):
 # Disk space validation
 # ---------------------------------------------------------------------------
 
-def check_disk_space(model_name):
+def check_disk_space(model_name: str) -> dict:
     """
     Validate whether the target drive has enough free space to install a model.
 
@@ -237,37 +550,22 @@ def check_disk_space(model_name):
        Falls back to the user home directory if the variable is not set or the
        path does not exist yet.
     2. Look up the required GB from MODEL_SIZES_GB. If the model is not in the
-       catalogue (e.g. the user typed a custom name), treat required size as 0
-       and return a warning asking the user to verify manually.
+       catalogue (e.g. a custom name), treat required size as 0 and warn.
     3. Three possible outcomes:
        - BLOCKED  (can_install=False): free space < required size.
-                  The install cannot proceed.
-       - WARNING  (can_install=True,  warning=True): the install would fit, but
-                  the remaining free space after install would be ≤ 10 % of the
-                  total drive capacity. The user may still proceed.
+       - WARNING  (can_install=True,  warning=True): fits but ≤ 10% would remain.
        - OK       (can_install=True,  warning=False): plenty of space.
-
-    Parameters
-    ----------
-    model_name : str  — Ollama pull name, e.g. "llama3.1:8b"
 
     Returns
     -------
-    dict with keys:
-        can_install      (bool)  — False blocks the install button entirely
-        warning          (bool)  — True shows a caution message but allows install
-        message          (str)   — human-readable explanation for the UI
-        required_gb      (float) — how much space the model needs
-        free_gb          (float) — current free space on the target drive
-        total_gb         (float) — total capacity of the target drive
-        remaining_pct    (float) — % of drive free AFTER the install
+    dict with keys: can_install, warning, message, required_gb, free_gb,
+                    total_gb, remaining_pct
     """
-    # ── 1. Resolve the drive path to inspect ──────────────────────────────
+    # ── 1. Resolve the drive path ─────────────────────────────────────────
     ollama_models_env = os.environ.get("OLLAMA_MODELS", "")
     if ollama_models_env and os.path.exists(ollama_models_env):
         check_path = ollama_models_env
     else:
-        # Default Ollama storage locations
         default_path = os.path.join(os.path.expanduser("~"), ".ollama", "models")
         check_path   = default_path if os.path.exists(default_path) \
                        else os.path.expanduser("~")
@@ -276,12 +574,11 @@ def check_disk_space(model_name):
 
     # ── 2. Get drive stats ─────────────────────────────────────────────────
     try:
-        usage     = shutil.disk_usage(check_path)
-        total_gb  = usage.total / (1024 ** 3)
-        free_gb   = usage.free  / (1024 ** 3)
+        usage    = shutil.disk_usage(check_path)
+        total_gb = usage.total / (1024 ** 3)
+        free_gb  = usage.free  / (1024 ** 3)
     except Exception as ex:
         print(f"Could not read disk usage for {check_path}: {ex}")
-        # Return a safe warning so the UI doesn't crash
         return {
             "can_install":   True,
             "warning":       True,
@@ -319,7 +616,6 @@ def check_disk_space(model_name):
         f"remaining after: {remaining_after_gb:.1f} GB ({remaining_after_pct:.1f}%)"
     )
 
-    # BLOCKED — not enough free space
     if free_gb < required_gb:
         return {
             "can_install":   False,
@@ -336,7 +632,6 @@ def check_disk_space(model_name):
             "remaining_pct": remaining_after_pct,
         }
 
-    # WARNING — install fits but leaves ≤ 10 % free
     if remaining_after_pct <= 10.0:
         return {
             "can_install":   True,
@@ -353,7 +648,6 @@ def check_disk_space(model_name):
             "remaining_pct": remaining_after_pct,
         }
 
-    # OK — sufficient space
     return {
         "can_install":   True,
         "warning":       False,
@@ -372,17 +666,10 @@ def check_disk_space(model_name):
 # Ollama model uninstall
 # ---------------------------------------------------------------------------
 
-def uninstall_ollama_model(model_name):
+def uninstall_ollama_model(model_name: str) -> tuple[bool, str]:
     """
     Remove an installed Ollama model by running:
         ollama rm <model_name>
-
-    The model files are deleted from the OLLAMA_MODELS directory.
-    This action is irreversible — the model must be re-downloaded to use it again.
-
-    Parameters
-    ----------
-    model_name : str  — e.g. "llama3.1:8b"
 
     Returns
     -------
@@ -395,7 +682,7 @@ def uninstall_ollama_model(model_name):
             ["ollama", "rm", model_name],
             capture_output=True,
             text=True,
-            timeout=120,    # removal should be fast — just deletes local files
+            timeout=120,
         )
         if result.returncode == 0:
             msg = f"Model '{model_name}' uninstalled successfully."
@@ -418,7 +705,7 @@ def uninstall_ollama_model(model_name):
         msg = f"Unexpected error during uninstall of '{model_name}': {ex}"
         print(msg)
         return False, msg
-    
+
 # ---------------------------------------------------------------------------
 # File & resource management
 # ---------------------------------------------------------------------------
@@ -447,36 +734,84 @@ def delete_remaining_resources():
                     print(f"Failed to delete {file_path}: {ex}")
 
 
-def save_uploaded_files(uploaded_files):
+def save_uploaded_files(uploaded_files) -> tuple[str | None, list[str]]:
     """
-    Save uploaded Streamlit file objects to resources_path, compute an MD5
-    checksum of the saved content, and write it to the checksum file.
-    Returns the checksum string on success, or None on failure.
+    Extract text from each uploaded file and persist it as a ResourcesFile_ .txt.
+
+    All file types (pdf, docx, xlsx, pptx, csv, xml, json, md, txt) are converted
+    to plain text at this stage. Downstream functions (embeddings, reranker) only
+    ever see UTF-8 .txt files regardless of the original format.
+
+    Each saved file is prefixed with a '[Source: <filename>]' header so the LLM
+    knows which document a text chunk originates from.
+
+    Parameters
+    ----------
+    uploaded_files : list[UploadedFile]
+        Pre-validated Streamlit file objects.
+
+    Returns
+    -------
+    (checksum, warnings)
+        checksum : str | None
+            MD5 hex digest of all saved resource files, or None if none were saved.
+        warnings : list[str]
+            Per-file extraction warnings (e.g. a file that could not be parsed).
+            Does not include validation errors — those are checked earlier.
     """
+    warnings: list[str] = []
+
     # Remove any existing ResourcesFile_ entries before saving new ones
-    pattern = os.path.join(resources_path, "ResourcesFile_*")
-    for file in glob.glob(pattern):
+    for file in glob.glob(os.path.join(resources_path, "ResourcesFile_*")):
         try:
             os.remove(file)
             print(f"Deleted old resource file: {file}")
         except Exception as ex:
             print(f"Error deleting resource file {file}: {ex}")
 
-    # Write each uploaded file to disk with a timestamped name
+    saved_count = 0
     for index, uploaded_file in enumerate(uploaded_files):
-        new_filename = f"{filename_prefix}_{index + 1}.txt"
-        file_path = os.path.join(resources_path, new_filename)
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.read())
-        print(f"Saved uploaded file: {file_path}")
+        source_name = uploaded_file.name
 
-    # Compute checksum of the newly saved files
+        # ── Extract text from the file ────────────────────────────────────
+        try:
+            text_content = extract_text_from_file(uploaded_file)
+        except ValueError as exc:
+            msg = f"⚠️ '{source_name}': skipped — {exc}"
+            print(msg)
+            warnings.append(msg)
+            continue    # Do not save a resource file for this upload
+
+        if not text_content.strip():
+            msg = f"⚠️ '{source_name}': skipped — no text content was extracted."
+            print(msg)
+            warnings.append(msg)
+            continue
+
+        # ── Persist as UTF-8 .txt with source header ──────────────────────
+        new_filename = f"{filename_prefix}_{index + 1}.txt"
+        file_path    = os.path.join(resources_path, new_filename)
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(f"[Source: {source_name}]\n\n{text_content}\n")
+            print(f"Saved extracted text ({len(text_content):,} chars): {file_path}")
+            saved_count += 1
+        except OSError as exc:
+            msg = f"⚠️ '{source_name}': could not write resource file — {exc}"
+            print(msg)
+            warnings.append(msg)
+
+    if saved_count == 0:
+        print("No resource files were saved.")
+        return None, warnings
+
+    # ── Compute checksum across all newly saved files ─────────────────────
     new_checksum = compute_resources_checksum(resources_path)
     if not new_checksum:
         print("Error: checksum computation returned empty.")
-        return None
+        return None, warnings
 
-    # Write checksum into any existing current_checksum_ file in resources_path
+    # Write checksum to any existing current_checksum_ file
     for filename in sorted(os.listdir(resources_path)):
         if filename.startswith("current_checksum_") and filename.endswith(".txt"):
             filepath = os.path.join(resources_path, filename)
@@ -487,19 +822,19 @@ def save_uploaded_files(uploaded_files):
             except Exception as ex:
                 print(f"Error writing checksum to {filepath}: {ex}")
 
-    return new_checksum
+    return new_checksum, warnings
 
 
-def compute_resources_checksum(directory):
+def compute_resources_checksum(directory: str) -> str | None:
     """
     Compute an MD5 hash across all ResourcesFile_ .txt files in the directory.
     Returns the hex digest string, or None if no files are found.
     """
-    hash_md5 = hashlib.md5()
+    hash_md5  = hashlib.md5()
     found_any = False
     for filename in sorted(os.listdir(directory)):
         if filename.startswith("ResourcesFile_") and filename.endswith(".txt"):
-            filepath = os.path.join(directory, filename)
+            filepath  = os.path.join(directory, filename)
             found_any = True
             with open(filepath, "rb") as f:
                 for chunk in iter(lambda: f.read(4096), b""):
@@ -510,7 +845,7 @@ def compute_resources_checksum(directory):
     return hash_md5.hexdigest()
 
 
-def check_exists_checksum_file(directory):
+def check_exists_checksum_file(directory: str) -> str | None:
     """
     Find the current checksum file in the given directory.
     If none exists, create a new empty one.
@@ -525,10 +860,10 @@ def check_exists_checksum_file(directory):
             matching_files.sort()
             return os.path.join(directory, matching_files[0])
 
-        # No checksum file found — create a new empty one
         print("No checksum file found. Creating a new one.")
-        new_checksum_filename = f"current_checksum_{current_datetime}.txt"
-        new_checksum_filepath = os.path.join(directory, new_checksum_filename)
+        new_checksum_filepath = os.path.join(
+            directory, f"current_checksum_{current_datetime}.txt"
+        )
         with open(new_checksum_filepath, "w") as f:
             f.write("")
         print(f"Created new empty checksum file: {new_checksum_filepath}")
@@ -542,12 +877,23 @@ def check_exists_checksum_file(directory):
         return None
 
 
-def check_for_uploaded_files(uploaded_files):
+def check_for_uploaded_files(uploaded_files) -> tuple | None:
     """
-    Orchestrate the upload flow:
-      1. Save uploaded files to disk
-      2. Compare new checksum against the stored one
-      3. Return cached embeddings if unchanged, or create new ones if changed
+    Orchestrate the full upload flow:
+      1. Save (extract + persist) uploaded files to disk.
+      2. Compare new checksum against the stored one.
+      3. Return cached embeddings if unchanged, or create new ones if changed.
+
+    Parameters
+    ----------
+    uploaded_files : list[UploadedFile]
+        Pre-validated Streamlit file objects (validation has already been run
+        in the UI layer via validate_uploaded_files() before this is called).
+
+    Returns
+    -------
+    (texts, vectors, warnings) — on success
+    None                       — if no files were provided
     """
     current_checksum_path = check_exists_checksum_file(resources_path)
 
@@ -567,13 +913,18 @@ def check_for_uploaded_files(uploaded_files):
         except Exception as ex:
             print(f"Error reading checksum file: {ex}")
 
-    # Save files and compute new checksum
-    new_checksum_value = save_uploaded_files(uploaded_files)
+    # Save files (text extraction happens here) and compute new checksum
+    new_checksum_value, extraction_warnings = save_uploaded_files(uploaded_files)
     print(f"New checksum: {new_checksum_value}")
+
+    if new_checksum_value is None:
+        # All files failed extraction — nothing to embed
+        return [], np.array([]), extraction_warnings
 
     if current_checksum_value and current_checksum_value == new_checksum_value:
         print("Checksum matches — loading cached embeddings.")
-        return load_embeddings_from_file()
+        texts, vectors = load_embeddings_from_file()
+        return texts, vectors, extraction_warnings
 
     print("Checksum differs — creating new embeddings.")
     embeddings_data = create_embeddings()
@@ -587,10 +938,11 @@ def check_for_uploaded_files(uploaded_files):
         except Exception as ex:
             print(f"Error updating checksum file: {ex}")
 
-    return embeddings_data
+    texts, vectors = embeddings_data
+    return texts, vectors, extraction_warnings
 
 
-def load_resources(directory):
+def load_resources(directory: str) -> list[str]:
     """
     Load all ResourcesFile_ .txt files from the given directory.
     Returns a list of strings (one per file).
@@ -608,7 +960,7 @@ def load_resources(directory):
 # Embedding — local sentence-transformers model
 # ---------------------------------------------------------------------------
 
-def create_embeddings_local(texts):
+def create_embeddings_local(texts: list[str]) -> dict:
     """
     Encode a list of text strings into embedding vectors using the local
     BAAI/bge-small-en-v1.5 model. Runs entirely on CPU with no API call.
@@ -623,13 +975,12 @@ def create_embeddings_local(texts):
         return {}
 
 
-def create_embeddings(embeddings_dir=embeddings_path):
+def create_embeddings(embeddings_dir: str = embeddings_path) -> tuple:
     """
     Delete any existing embedding .pkl files, create fresh embeddings from
     all resource files, and save them to a new timestamped .pkl file.
     Returns (texts, numpy_vectors) tuple.
     """
-    # Remove old embedding files
     for file in glob.glob(os.path.join(embeddings_dir, "current_embeddings_*")):
         try:
             os.remove(file)
@@ -649,7 +1000,6 @@ def create_embeddings(embeddings_dir=embeddings_path):
         print("Embedding creation failed.")
         return [], np.array([])
 
-    # Save to a new timestamped .pkl file
     new_filename  = f"current_embeddings_{current_datetime}.pkl"
     new_file_path = os.path.join(embeddings_dir, new_filename)
     with open(new_file_path, "wb") as f:
@@ -659,7 +1009,7 @@ def create_embeddings(embeddings_dir=embeddings_path):
 
 
 @st.cache_data
-def load_embeddings_from_file(embeddings_dir=embeddings_path):
+def load_embeddings_from_file(embeddings_dir: str = embeddings_path) -> tuple:
     """
     Load embeddings from the most recent .pkl file in embeddings_dir.
     Falls back to creating new embeddings if no .pkl file is found.
@@ -684,10 +1034,10 @@ def load_embeddings_from_file(embeddings_dir=embeddings_path):
 # Reranking — local CrossEncoder model
 # ---------------------------------------------------------------------------
 
-def local_score_rank(query, texts):
+def local_score_rank(query: str, texts: list[str]) -> dict:
     """
     Score each (query, document) pair using the local CrossEncoder model.
-    Returns a dict {"scores": list_of_floats} to match the original interface.
+    Returns a dict {"scores": list_of_floats}.
     Runs entirely on CPU with no API call.
     """
     try:
@@ -700,7 +1050,7 @@ def local_score_rank(query, texts):
         return {}
 
 
-def get_most_relevant_docs(query, texts):
+def get_most_relevant_docs(query: str, texts: list[str]) -> list[str]:
     """
     Return the uploaded documents sorted by relevance to the query,
     most relevant first, using the local CrossEncoder reranker.
@@ -725,7 +1075,12 @@ def get_most_relevant_docs(query, texts):
 # LLM chat — Ollama via OpenAI-compatible client
 # ---------------------------------------------------------------------------
 
-def llm_chat(messages=[], model="llama3.1:8b", temperature=0.3, max_tokens=4096):
+def llm_chat(
+    messages:    list[dict] = [],
+    model:       str        = "llama3.1:8b",
+    temperature: float      = 0.3,
+    max_tokens:  int        = 4096,
+) -> str:
     """
     Send a list of messages to the Ollama LLM and return the response as a string.
 
@@ -740,7 +1095,6 @@ def llm_chat(messages=[], model="llama3.1:8b", temperature=0.3, max_tokens=4096)
     -------
     str — the assistant's reply, or an error message string on failure
     """
-    # Larger models benefit from more tokens
     if model in ("mistral:latest", "phi4:latest"):
         max_tokens = 8192
 
@@ -762,7 +1116,7 @@ def llm_chat(messages=[], model="llama3.1:8b", temperature=0.3, max_tokens=4096)
 # Chat export
 # ---------------------------------------------------------------------------
 
-def generate_output_file(chat_history):
+def generate_output_file(chat_history: list[dict]) -> str | None:
     """
     Write the full chat history to a timestamped .txt file in output_dir.
     Returns the file path on success, or None if chat_history is empty.
