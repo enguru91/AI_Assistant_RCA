@@ -25,7 +25,7 @@ import os
 import time
 
 # Import backend functions
-from backend.functions import (
+from backend.Functions import (
     llm_chat,
     generate_output_file,
     check_for_uploaded_files,

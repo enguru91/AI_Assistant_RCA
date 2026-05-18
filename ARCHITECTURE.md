@@ -2,190 +2,189 @@
 
 ## Overview
 
-AI Assistant RCA is a locally hosted Retrieval-Augmented Generation (RAG) application. The user uploads reference documents, which are converted into searchable embeddings. When the user asks a question, the most relevant document sections are retrieved and passed alongside the question to a local LLM, which generates the final answer.
+AI Assistant RCA is a locally hosted Retrieval-Augmented Generation (RAG) application. When the user uploads reference documents, the app converts them into searchable embedding vectors. On each query, the most relevant document sections are retrieved, reranked, and passed to a local LLM alongside the question. The LLM then generates a grounded answer.
 
-Everything runs on the user's machine. No data is sent to external services.
-
----
-
-## High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  User (Browser)                     │
-│              http://localhost:8501                  │
-└───────────────────────┬─────────────────────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────┐
-│              Streamlit GUI Layer                    │
-│              AI_Checker_v2.py                       │
-│                                                     │
-│  - Model selector dropdown                          │
-│  - File uploader                                    │
-│  - Prompt input                                     │
-│  - Chat history display                             │
-│  - Export / New Chat buttons                        │
-└───────────────────────┬─────────────────────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────┐
-│              Backend Logic Layer                    │
-│              backend/functions_v2.py                │
-│                                                     │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────┐   │
-│  │  Embedding  │  │  Reranking   │  │  LLM Chat │   │
-│  │  Module     │  │  Module      │  │  Module   │   │
-│  └──────┬──────┘  └──────┬───────┘  └─────┬─────┘   │
-└─────────┼────────────────┼────────────────┼─────────┘
-          │                │                │
-          ▼                ▼                ▼
-┌──────────────────┐  ┌──────────┐   ┌─────────────────┐
-│ sentence-        │  │ sentence-│   │ Ollama Server   │
-│ transformers     │  │ transform│   │ localhost:11434 │
-│ BAAI/bge-small   │  │ CrossEnc │   │                 │
-│ (local, CPU)     │  │ (local)  │   │ llama3.1:8b     │
-└──────────────────┘  └──────────┘   │ mistral:latest  │
-                                     │ qwen2.5:7b      │
-                                     │ phi4:latest     │
-                                     └─────────────────┘
-```
+Everything runs on the user's machine — no data is sent anywhere externally.
 
 ---
 
-## Component Breakdown
+## System Diagram
 
-### 1. Streamlit GUI — `AI_Checker_v2.py`
+```
+┌─────────────────────────────────────────┐
+│           Browser (User)                │
+│        http://localhost:8501            │
+└──────────────────┬──────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────┐
+│        AI_Checker.py                 │
+│        Streamlit UI Layer               │
+│                                         │
+│  • Ollama connection status             │
+│  • Dynamic model dropdown               │
+│  • Install / Uninstall model expanders  │
+│  • File uploader                        │
+│  • Prompt input & chat display          │
+│  • Export Chat / New Chat buttons       │
+└──────────────────┬──────────────────────┘
+                   │ calls
+                   ▼
+┌─────────────────────────────────────────┐
+│        backend/Functions.py          │
+│        Backend Logic Layer              │
+│                                         │
+│  ┌──────────────┐  ┌─────────────────┐  │
+│  │  Embedding   │  │   Reranking     │  │
+│  │  Module      │  │   Module        │  │
+│  │  bge-small   │  │   CrossEncoder  │  │
+│  │  (local CPU) │  │   (local CPU)   │  │
+│  └──────────────┘  └─────────────────┘  │
+│                                         │
+│  ┌──────────────┐  ┌─────────────────┐  │
+│  │  LLM Chat    │  │  Model Manager  │  │
+│  │  Module      │  │  list / install │  │
+│  │  OpenAI SDK  │  │  uninstall      │  │
+│  └──────┬───────┘  └─────────────────┘  │
+└─────────┼───────────────────────────────┘
+          │ HTTP /v1
+          ▼
+┌─────────────────────────────────────────┐
+│        Ollama Server                    │
+│        http://localhost:11434           │
+│                                         │
+│  llama3.1:8b  │  mistral  │  qwen2.5   │
+└─────────────────────────────────────────┘
+```
 
-The entry point and user interface. Responsibilities:
+---
 
-- Renders all UI elements (dropdowns, inputs, buttons, chat display)
-- Manages Streamlit session state (`chat_history`, `texts`, `vectors`)
-- Calls backend functions and handles their responses
-- Manages the LLM response timeout using `concurrent.futures.ThreadPoolExecutor`
+## Backend Functions — `Functions.py`
 
-Session state variables:
+### Ollama Interface
 
-| Variable | Type | Purpose |
+| Function | Description |
+|---|---|
+| `check_ollama_connection()` | Calls `ollama_client.models.list()`. Returns `(True, model_list)` or `(False, error)`. Used to render the connection status banner in the UI. |
+| `list_ollama_models()` | Returns a sorted list of installed model names. Called on every page load to populate the model dropdown dynamically. |
+| `install_ollama_model(model_name)` | Runs `ollama pull <model>` via `subprocess`. Blocks until the download completes. 1-hour timeout. Returns `(bool, message)`. |
+| `uninstall_ollama_model(model_name)` | Runs `ollama rm <model>` via `subprocess`. 120-second timeout. Returns `(bool, message)`. |
+| `check_disk_space(model_name)` | Reads drive stats with `shutil.disk_usage()` on the OLLAMA_MODELS path. Returns a dict with three possible outcomes — see below. |
+
+**`check_disk_space()` outcomes:**
+
+| State | Condition | Effect in UI |
 |---|---|---|
-| `chat_history` | list of dicts | Stores all user/assistant messages |
-| `texts` | list of str | Raw text content from uploaded documents |
-| `vectors` | numpy array | Embedding vectors corresponding to `texts` |
-| `upload_success` | bool | Tracks whether file upload completed |
+| BLOCKED | `free_gb < required_gb` | Error shown, install buttons not rendered |
+| WARNING | Install fits but ≤ 10% of drive remains | Warning shown, user must tick a checkbox to proceed |
+| OK | Sufficient space | Success message, install buttons shown normally |
+
+### Embedding Module
+
+| Function | Description |
+|---|---|
+| `create_embeddings_local(texts)` | Encodes a list of strings into 384-dimensional vectors using `BAAI/bge-small-en-v1.5`. Runs on CPU. Returns `{"vectors": [...]}`. |
+| `create_embeddings()` | Deletes old `.pkl` files, loads resource texts, calls `create_embeddings_local()`, saves result to a new timestamped `.pkl`. Returns `(texts, np.array)`. |
+| `load_embeddings_from_file()` | Loads the latest `.pkl` from the embeddings directory. Falls back to `create_embeddings()` if none exists. Cached by `@st.cache_data`. |
+
+### Reranking Module
+
+| Function | Description |
+|---|---|
+| `local_score_rank(query, texts)` | Scores every `(query, document)` pair using `cross-encoder/ms-marco-MiniLM-L-6-v2`. Returns `{"scores": [...]}`. |
+| `get_most_relevant_docs(query, texts)` | Calls `local_score_rank()` and returns documents sorted by score, highest first. |
+
+### File Management
+
+| Function | Description |
+|---|---|
+| `delete_remaining_resources()` | Deletes leftover `ResourcesFile_`, `current_checksum_`, and `current_embeddings_` files from the previous session. Called once at startup. |
+| `save_uploaded_files(uploaded_files)` | Saves uploaded Streamlit file objects to disk and computes an MD5 checksum of the saved content. |
+| `compute_resources_checksum(directory)` | MD5 hash across all `ResourcesFile_*.txt` files. Used to detect whether uploaded files have changed. |
+| `check_for_uploaded_files(uploaded_files)` | Orchestrates the upload flow — compares checksums and either loads cached embeddings or creates new ones. |
+| `generate_output_file(chat_history)` | Writes the full chat history to a timestamped `.txt` file in the Outputs/Chats directory. |
 
 ---
 
-### 2. Backend Logic — `backend/functions_v2.py`
+## Data Flows
 
-All non-UI logic lives here. It is split into four functional areas:
-
-#### A. File & Checksum Management
-- `save_uploaded_files()` — saves uploaded files to `ProcedureFiles/` with a timestamped name
-- `compute_resources_checksum()` — computes an MD5 hash of all resource files to detect changes
-- `check_exists_checksum_file()` — finds or creates the current checksum file
-- `check_for_uploaded_files()` — orchestrates the upload flow: compares checksums and decides whether to reuse cached embeddings or create new ones
-- `delete_remaining_resources()` — cleans up leftover files from previous sessions on startup
-
-#### B. Embedding Module
-- `create_embeddings_local()` — encodes all resource texts into vectors using `BAAI/bge-small-en-v1.5` via `sentence-transformers`
-- `create_embeddings()` — manages deletion of old embedding files, calls the encoder, saves results to a `.pkl` file
-- `load_embeddings_from_file()` — loads the latest cached `.pkl` file; falls back to creating new embeddings if none exist
-
-#### C. Reranking Module
-- `local_score_rank()` — uses `cross-encoder/ms-marco-MiniLM-L-6-v2` to score each (query, document) pair
-- `get_most_relevant_docs()` — calls `local_score_rank()` and returns documents sorted by relevance score
-
-#### D. LLM Chat Module
-- `llm_chat()` — sends the structured prompt messages to Ollama via the OpenAI-compatible `/v1/chat/completions` endpoint and returns the response text
-- `generate_output_file()` — writes the full chat history to a timestamped `.txt` file
-
----
-
-### 3. Embedding Model — `BAAI/bge-small-en-v1.5`
-
-- Runs entirely locally on CPU via `sentence-transformers`
-- Converts text chunks into 384-dimensional vectors
-- Used to represent both the uploaded documents and (optionally) the user query in the same vector space
-- Model files are cached locally after first download (~130 MB)
-
----
-
-### 4. Reranking Model — `cross-encoder/ms-marco-MiniLM-L-6-v2`
-
-- Runs entirely locally on CPU via `sentence-transformers`
-- Takes `(query, document)` pairs and outputs a relevance score for each
-- More accurate than cosine similarity alone — it reads both texts together rather than comparing independent vectors
-- Model files are cached locally after first download (~80 MB)
-
----
-
-### 5. Ollama LLM Server
-
-- Runs as a background service on `http://localhost:11434`
-- Exposes an OpenAI-compatible API at `/v1` — this is what the `openai` Python SDK connects to
-- The `/v1` path is not a separate server; it is the same Ollama process responding in OpenAI's JSON format
-- The `api_key` value `"ollama"` is required by the SDK but is ignored by Ollama — no real authentication occurs locally
-
----
-
-## Data Flow — Single Query
+### Query with uploaded documents (RAG)
 
 ```
-User types a question
+User submits a question
         │
         ▼
-[ AI_Checker_v2.py ]
-  Appends question to chat_history
+get_most_relevant_docs()
+  — CrossEncoder scores each (query, document) pair
+  — Returns documents sorted by relevance
         │
         ▼
-[ get_most_relevant_docs() ]
-  Passes (query, each document) pairs to CrossEncoder
+llm_chat()
+  — Builds prompt: system instruction + context + question
+  — Sends to Ollama via OpenAI SDK → /v1/chat/completions
         │
         ▼
-[ local_score_rank() ]
-  Returns relevance scores → documents sorted by score
-        │
-        ▼
-[ llm_chat() ]
-  Builds prompt:
-    system: "You are a knowledgeable assistant."
-    user:   "Context: <top ranked docs>\nQuestion: <query>"
-  Sends to Ollama via OpenAI SDK
-        │
-        ▼
-[ Ollama ]
-  Selected model generates a response
-        │
-        ▼
-[ AI_Checker_v2.py ]
-  Appends response to chat_history
-  Renders updated chat in the browser
+Response string appended to chat_history
+UI re-renders with updated conversation
 ```
 
----
-
-## Data Flow — File Upload
+### Query without documents (direct LLM)
 
 ```
-User uploads TXT/CSV files
+User submits a question
         │
         ▼
-[ check_for_uploaded_files() ]
-  Saves files to ProcedureFiles/
-  Computes MD5 checksum of new files
-        │
-        ├── Checksum matches existing? ──► Load cached .pkl embeddings
-        │
-        └── Checksum differs? ──────────► Delete old .pkl
-                                          Call create_embeddings()
-                                          Encode all texts → vectors
-                                          Save new .pkl to Embeddings/
-                                          Return (texts, vectors)
+llm_chat()
+  — Sends question directly with no context
         │
         ▼
-[ AI_Checker_v2.py ]
-  Stores texts and vectors in session state
-  Ready for queries
+Response string appended to chat_history
+```
+
+### File upload
+
+```
+User uploads TXT / CSV files
+        │
+        ▼
+check_for_uploaded_files()
+  — Saves files to ProcedureFiles/
+  — Computes MD5 checksum
+        │
+        ├── Checksum unchanged → load cached .pkl
+        │
+        └── Checksum changed  → create_embeddings()
+                                  encode all texts → vectors
+                                  save new .pkl
+        │
+        ▼
+(texts, vectors) stored in st.session_state
+Ready for queries
+```
+
+### Model install
+
+```
+User selects a model from the catalogue
+        │
+        ▼
+check_disk_space()
+  — Resolves OLLAMA_MODELS path
+  — Reads drive stats via shutil.disk_usage()
+  — Compares free space against MODEL_SIZES_GB
+        │
+        ├── BLOCKED  → error, no buttons rendered
+        ├── WARNING  → warning + checkbox required before buttons appear
+        └── OK       → success message, buttons rendered
+        │
+User clicks "Yes, install"
+        │
+        ▼
+install_ollama_model()   — runs `ollama pull <model>`
+        │
+        ▼
+Success / failure message shown
+User refreshes page → model appears in dropdown
 ```
 
 ---
@@ -193,32 +192,31 @@ User uploads TXT/CSV files
 ## File Storage Layout
 
 ```
-Includes/
+NRJ-Dev/Include/
 ├── ProcedureFiles/
-│   ├── ResourcesFile_<timestamp>_1.txt    ← saved uploaded files
-│   ├── ResourcesFile_<timestamp>_2.txt
-│   └── current_checksum_<timestamp>.txt   ← MD5 of current resource files
+│   ├── ResourcesFile_<timestamp>_1.txt     ← uploaded files saved here
+│   └── current_checksum_<timestamp>.txt    ← MD5 of current resource files
 └── Outputs/
     ├── Embeddings/
-    │   └── current_embeddings_<timestamp>.pkl  ← cached vectors + texts
+    │   └── current_embeddings_<timestamp>.pkl   ← cached vectors + texts
     └── Chats/
-        └── chat_output_<timestamp>.txt          ← exported chat history
+        └── chat_output_<timestamp>.txt           ← exported conversations
 ```
 
-All files under `Includes/` are excluded from version control via `.gitignore`.
+All files under `NRJ-Dev/` are excluded from version control via `.gitignore`.
 
 ---
 
 ## Technology Stack
 
-| Layer | Technology |
+| Component | Technology |
 |---|---|
-| GUI | Streamlit 1.57.0 |
-| Embedding model | `sentence-transformers` — BAAI/bge-small-en-v1.5 |
-| Reranking model | `sentence-transformers` — cross-encoder/ms-marco-MiniLM-L-6-v2 |
+| UI | Streamlit 1.57.0 |
 | LLM runtime | Ollama (local) |
-| LLM API client | `openai` SDK 2.37.0 pointed at Ollama's `/v1` endpoint |
-| Similarity | `scikit-learn` cosine similarity |
-| Numerical ops | `numpy` |
+| LLM API client | `openai` 2.37.0 → Ollama `/v1` endpoint |
+| Embedding model | `sentence-transformers` — BAAI/bge-small-en-v1.5 (~130 MB, CPU) |
+| Reranking model | `sentence-transformers` — cross-encoder/ms-marco-MiniLM-L-6-v2 (~80 MB, CPU) |
+| Disk space check | Python `shutil.disk_usage()` |
+| Model management | Python `subprocess` → `ollama pull` / `ollama rm` |
+| Embedding cache | Python `pickle` |
 | Config | `python-dotenv` |
-| Serialisation | `pickle` (embedding cache) |
