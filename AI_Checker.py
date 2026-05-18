@@ -1,12 +1,21 @@
 # Author: Eshan Gurusinghe
 # Email: engurusinghe91@gmail.com
-# Version: 3.0 — Migrated from Ericsson ELI API to local Ollama stack
-# Date: 2026-05-17
+# Version: 3.0 — Migrated from Ericsson ELI API to local Ollama stack -> Date: 2026-05-17
+# Version: 3.1 — Dynamic model selector and model installation feature
+#              — Install flow now runs check_disk_space() before showing install buttons
+#              — BLOCKED state: install buttons hidden, error shown with exact shortfall
+#              — WARNING state: warning shown, user must tick "I understand" checkbox to proceed
+#              — OK state: space metrics shown, install proceeds normally
+#              — Added "Uninstall a model" expander with at-least-one-model guard -> Date: 2026-05-18
 # Changes from v2:
 #   - llm_chat()
 #   - Ollama connection status indicator
 #   - Updated model dropdown           → Ollama model names
 #   - Updated LLM response handling    → response is now a plain string, not a dict
+#   - Model dropdown now populated dynamically via list_ollama_models()
+#   - Added "Install a model" expander with Yes/No confirmation flow
+#   - Added install_ollama_model() import
+#   - Added KNOWN_OLLAMA_MODELS import for the install catalogue
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -24,6 +33,12 @@ from backend.functions import (
     get_most_relevant_docs,
     delete_remaining_resources,
     check_ollama_connection,
+    list_ollama_models,
+    install_ollama_model,
+    uninstall_ollama_model,
+    check_disk_space,
+    KNOWN_OLLAMA_MODELS,
+    MODEL_SIZES_GB,
 )
 
 # ---------------------------------------------------------------------------
@@ -34,14 +49,24 @@ load_dotenv()
 delete_remaining_resources()  # Clean up any leftover files from the previous session
 
 # Session state defaults
-if "chat_history"   not in st.session_state:
-    st.session_state["chat_history"]   = []
-if "texts"          not in st.session_state:
-    st.session_state["texts"]          = []
-if "vectors"        not in st.session_state:
-    st.session_state["vectors"]        = np.array([])
-if "upload_success" not in st.session_state:
-    st.session_state["upload_success"] = False
+if "chat_history"    not in st.session_state:
+    st.session_state["chat_history"]    = []
+if "texts"           not in st.session_state:
+    st.session_state["texts"]           = []
+if "vectors"         not in st.session_state:
+    st.session_state["vectors"]         = np.array([])
+if "upload_success"  not in st.session_state:
+    st.session_state["upload_success"]  = False
+if "installed_models" not in st.session_state:
+    st.session_state["installed_models"] = []
+if "confirm_install" not in st.session_state:
+    st.session_state["confirm_install"] = False
+if "model_to_install" not in st.session_state:
+    st.session_state["model_to_install"] = ""
+if "confirm_uninstall" not in st.session_state:
+    st.session_state["confirm_uninstall"] = False
+if "model_to_uninstall" not in st.session_state:
+    st.session_state["model_to_uninstall"] = ""
 
 # ---------------------------------------------------------------------------
 # Page header
@@ -65,13 +90,221 @@ else:
     )
 
 # ---------------------------------------------------------------------------
-# Model selection
+# Dynamic model selection
 # ---------------------------------------------------------------------------
 
-model_choice = st.selectbox(
-    "Select AI model",
-    options=["llama3.1:8b", "mistral:latest", "qwen2.5:7b", "phi4:latest"],
-)
+# Fetch installed models from Ollama on every page load.
+# This reflects the real state — if the user just installed a model, it appears immediately.
+installed_models = list_ollama_models()
+st.session_state["installed_models"] = installed_models
+
+if installed_models:
+    model_choice = st.selectbox(
+        "Select AI model",
+        options=installed_models,
+        help="Only models already installed in Ollama are listed here.",
+    )
+else:
+    model_choice = None
+    st.warning(
+        "No models installed in Ollama yet. "
+        "Use the **Install a model** section below to add one."
+    )
+
+# ---------------------------------------------------------------------------
+# Model installation — expander with disk space check + Yes / No confirmation
+# ---------------------------------------------------------------------------
+
+with st.expander("Install a model"):
+    st.write(
+        "Select a model from the catalogue. "
+        "The approximate download size is shown next to each name. "
+        "Disk space on the Ollama models drive is checked automatically before downloading."
+    )
+
+    # Only models not yet installed appear in this list
+    not_installed = {
+        label: pull_name
+        for label, pull_name in KNOWN_OLLAMA_MODELS.items()
+        if pull_name not in installed_models
+    }
+
+    if not not_installed:
+        st.success("All catalogue models are already installed.")
+    else:
+        selected_label = st.selectbox(
+            "Choose a model to install",
+            options=list(not_installed.keys()),
+            key="install_model_select",
+        )
+        selected_pull_name = not_installed[selected_label]
+
+        # ── Disk space check ──────────────────────────────────────────────
+        space = check_disk_space(selected_pull_name)
+
+        # Always show the three space metrics for full transparency
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Required",         f"{space['required_gb']:.1f} GB")
+        m2.metric("Free on drive",    f"{space['free_gb']:.1f} GB")
+        m3.metric("Remaining after",  f"{space['remaining_pct']:.1f} %")
+
+        # ── BLOCKED — not enough space ────────────────────────────────────
+        if not space["can_install"]:
+            st.error(
+                f"**Cannot install — insufficient disk space.**\n\n"
+                f"{space['message']}"
+            )
+            # Install buttons are intentionally NOT rendered here
+
+        # ── WARNING — install fits but ≤ 10 % will remain ─────────────────
+        elif space["warning"]:
+            st.warning(
+                f"**Low disk space warning.**\n\n"
+                f"{space['message']}"
+            )
+            acknowledge = st.checkbox(
+                "I understand the risk and want to proceed with the installation.",
+                key="space_warning_ack",
+            )
+            if acknowledge:
+                col_yes, col_no = st.columns([1, 5])
+                with col_yes:
+                    yes_button = st.button("Yes, install", key="install_yes")
+                with col_no:
+                    no_button  = st.button("No, cancel",   key="install_no")
+
+                if yes_button:
+                    st.session_state["confirm_install"]  = True
+                    st.session_state["model_to_install"] = selected_pull_name
+                if no_button:
+                    st.session_state["confirm_install"]  = False
+                    st.session_state["model_to_install"] = ""
+                    st.info("Installation cancelled.")
+
+        # ── OK — sufficient space ─────────────────────────────────────────
+        else:
+            st.success(space["message"])
+            col_yes, col_no = st.columns([1, 5])
+            with col_yes:
+                yes_button = st.button("Yes, install", key="install_yes")
+            with col_no:
+                no_button  = st.button("No, cancel",   key="install_no")
+
+            if yes_button:
+                st.session_state["confirm_install"]  = True
+                st.session_state["model_to_install"] = selected_pull_name
+            if no_button:
+                st.session_state["confirm_install"]  = False
+                st.session_state["model_to_install"] = ""
+                st.info("Installation cancelled.")
+
+        # ── Execute download (shared by WARNING-acknowledged + OK paths) ──
+        if (
+            st.session_state.get("confirm_install")
+            and st.session_state.get("model_to_install") == selected_pull_name
+        ):
+            with st.spinner(
+                f"Downloading '{selected_pull_name}' — "
+                f"this may take several minutes ({space['required_gb']:.1f} GB)..."
+            ):
+                success, message = install_ollama_model(selected_pull_name)
+
+            st.session_state["confirm_install"]  = False
+            st.session_state["model_to_install"] = ""
+
+            if success:
+                st.success(
+                    f"**'{selected_pull_name}' installed successfully.** "
+                )
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error(f"Installation failed: {message}")
+
+# ---------------------------------------------------------------------------
+# Model uninstall — at-least-one-model guard + Yes / No confirmation
+# ---------------------------------------------------------------------------
+
+with st.expander("Uninstall a model"):
+
+    # ── Guard: block if no models installed ──────────────────────────────
+    if len(installed_models) == 0:
+        st.info("No models are installed yet.")
+
+    # ── Guard: block if only one model remains ────────────────────────────
+    elif len(installed_models) == 1:
+        st.error(
+            f"**Cannot uninstall '{installed_models[0]}'** — "
+            "at least one model must remain installed for the app to function. "
+            "Install a second model first, then you can remove this one."
+        )
+
+    # ── Safe to uninstall — two or more models present ────────────────────
+    else:
+        st.write(
+            "Select the model you want to remove. "
+            "The model files will be permanently deleted from your drive. "
+            "You can re-install it at any time from the **Install a model** section above."
+        )
+
+        model_to_remove = st.selectbox(
+            "Choose a model to uninstall",
+            options=installed_models,
+            key="uninstall_select",
+        )
+
+        # Show how much space will be recovered
+        recover_gb = MODEL_SIZES_GB.get(model_to_remove)
+        if recover_gb:
+            st.info(
+                f"Removing **'{model_to_remove}'** will free approximately "
+                f"**{recover_gb:.1f} GB** of disk space."
+            )
+        else:
+            st.info(
+                f"**'{model_to_remove}'** is not in the built-in catalogue — "
+                "disk space recovery amount is unknown."
+            )
+
+        st.warning(
+            f"**This action is irreversible.** "
+            f"'{model_to_remove}' will be permanently deleted and must be "
+            "re-downloaded to use again. Are you sure?"
+        )
+
+        col_yes_u, col_no_u = st.columns([1, 5])
+        with col_yes_u:
+            yes_uninstall = st.button("Yes, uninstall", key="uninstall_yes")
+        with col_no_u:
+            no_uninstall  = st.button("No, cancel",     key="uninstall_no")
+
+        if yes_uninstall:
+            st.session_state["confirm_uninstall"]  = True
+            st.session_state["model_to_uninstall"] = model_to_remove
+        if no_uninstall:
+            st.session_state["confirm_uninstall"]  = False
+            st.session_state["model_to_uninstall"] = ""
+            st.info("Uninstall cancelled.")
+
+        # ── Execute removal ───────────────────────────────────────────────
+        if (
+            st.session_state.get("confirm_uninstall")
+            and st.session_state.get("model_to_uninstall") == model_to_remove
+        ):
+            with st.spinner(f"Uninstalling '{model_to_remove}'..."):
+                success, message = uninstall_ollama_model(model_to_remove)
+
+            st.session_state["confirm_uninstall"]  = False
+            st.session_state["model_to_uninstall"] = ""
+
+            if success:
+                st.success(                                  
+                    f"**'{model_to_remove}' has been uninstalled.** "
+                )
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error(f"Uninstall failed: {message}")
 
 # ---------------------------------------------------------------------------
 # Prompt input
@@ -94,7 +327,7 @@ with col_middle:
     )
 
 with col_left:
-    chat_button = st.button("Ask AI", disabled=not ollama_ok)
+    chat_button = st.button("Ask AI", disabled=(not ollama_ok or model_choice is None))
 
 with col_right:
     has_history  = len(st.session_state["chat_history"]) > 0
@@ -321,9 +554,8 @@ if print_button:
 
 if new_chat_button:
     st.session_state.clear()
-    st.session_state["uploader_key"]          = str(time.time())
-    st.session_state["user_input"]            = ""
-    st.session_state["use_internal_libraries"]= False
+    st.session_state["uploader_key"]   = str(time.time())
+    st.session_state["user_input"]     = ""
     st.info("Session cleared — ready for a new chat.")
     time.sleep(1)
     st.rerun()

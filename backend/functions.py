@@ -1,19 +1,26 @@
 # Author: Eshan Gurusinghe
 # Email: engurusinghe91@gmail.com
-# Version: 3.0 — Migrated from Ericsson ELI API to local Ollama stack
-# Date: 2026-05-17
-#
+# Version: 3.0 — Migrated from Ericsson ELI API to local Ollama stack -> Date: 2026-05-17
+# Version: 3.1 — Added dynamic Ollama model listing and model installation/uninstallation
+#              — Added disk space validation before installation -> Date: 2026-05-18
 # Changes from v2:
 #   - Removed all Ericsson ELI API dependencies (eli package, ELIClient, eli-key)
 #   - create_embeddings_local()  using sentence-transformers
 #   - local_score_rank()         using CrossEncoder
 #   - llm_chat()                 using Ollama via OpenAI SDK
 #   - Added check_ollama_connection() for GUI health status
+#   - Added KNOWN_OLLAMA_MODELS     — curated catalogue of popular installable models
+#   - Added MODEL_SIZES_GB          — exact GB sizes for every catalogue model
+#   - Added check_disk_space()      — validates free disk space before install;
+#                                     blocks on insufficient space, warns at ≤10% remaining
+#   - Added uninstall_ollama_model() — runs `ollama rm <model>` via subprocess
 
 import os
 import pickle
 import glob
 import hashlib
+import subprocess
+import shutil
 import numpy as np
 import streamlit as st
 from datetime import datetime
@@ -80,6 +87,338 @@ def check_ollama_connection():
         print(f"Ollama connection failed: {ex}")
         return False, str(ex)
 
+# ---------------------------------------------------------------------------
+# Ollama model catalogue
+# ---------------------------------------------------------------------------
+
+# A curated list of popular, publicly available Ollama models.
+# Format: {"display_label": "ollama_pull_name"}
+# This is used to populate the "Install a model" dropdown in the UI.
+# Models the user already has installed are filtered out dynamically.
+
+# A curated list of popular, publicly available Ollama models.
+# Format: {"display_label": "ollama_pull_name"}
+# This is used to populate the "Install a model" dropdown in the UI.
+# Models the user already has installed are filtered out dynamically.
+
+KNOWN_OLLAMA_MODELS = {
+    # ── Small & fast (good for CPU-only machines) ──────────────────────────
+    "LLaMA 3.1 8B  (~4.7 GB)":    "llama3.1:8b",
+    "LLaMA 3.2 3B  (~2.0 GB)":    "llama3.2:3b",
+    "LLaMA 3.2 1B  (~1.3 GB)":    "llama3.2:1b",
+    "Mistral 7B    (~4.1 GB)":    "mistral:latest",
+    "Gemma 2 2B    (~1.6 GB)":    "gemma2:2b",
+    "Phi-3 Mini    (~2.2 GB)":    "phi3:mini",
+    "Qwen 2.5 7B   (~4.4 GB)":    "qwen2.5:7b",
+    "DeepSeek-R1 7B (~4.7 GB)":   "deepseek-r1:7b",
+    # ── Medium (GPU recommended) ──────────────────────────────────────────
+    "LLaMA 3.1 70B (~40 GB)":     "llama3.1:70b",
+    "Mistral Nemo 12B (~7.2 GB)": "mistral-nemo:latest",
+    "Gemma 2 9B    (~5.5 GB)":    "gemma2:9b",
+    "Phi-4 14B     (~9.1 GB)":    "phi4:latest",
+    "Qwen 2.5 14B  (~8.9 GB)":    "qwen2.5:14b",
+    "DeepSeek-R1 14B (~9.0 GB)":  "deepseek-r1:14b",
+    # ── Large (high-end GPU) ──────────────────────────────────────────────
+    "Qwen 2.5 32B  (~20 GB)":     "qwen2.5:32b",
+    "DeepSeek-R1 32B (~20 GB)":   "deepseek-r1:32b",
+    "LLaMA 3.3 70B (~43 GB)":     "llama3.3:70b",
+}
+
+# Approximate download sizes in GB for each model in the catalogue above.
+# Used by check_disk_space() to validate free space before starting a download.
+# Values are rounded conservatively upward to account for temporary extraction space.
+MODEL_SIZES_GB = {
+    "llama3.1:8b":          4.7,
+    "llama3.2:3b":          2.0,
+    "llama3.2:1b":          1.3,
+    "mistral:latest":       4.1,
+    "gemma2:2b":            1.6,
+    "phi3:mini":            2.2,
+    "qwen2.5:7b":           4.4,
+    "deepseek-r1:7b":       4.7,
+    "llama3.1:70b":        40.0,
+    "mistral-nemo:latest":  7.2,
+    "gemma2:9b":            5.5,
+    "phi4:latest":          9.1,
+    "qwen2.5:14b":          8.9,
+    "deepseek-r1:14b":      9.0,
+    "qwen2.5:32b":         20.0,
+    "deepseek-r1:32b":     20.0,
+    "llama3.3:70b":        43.0,
+}
+
+# ---------------------------------------------------------------------------
+# Dynamic Ollama model listing
+# ---------------------------------------------------------------------------
+
+def list_ollama_models():
+    """
+    Fetch the names of all models currently installed in Ollama.
+
+    Returns
+    -------
+    list[str]
+        Sorted list of installed model name strings (e.g. ["llama3.1:8b", "mistral:latest"]).
+        Returns an empty list if Ollama is unreachable or no models are installed.
+    """
+    try:
+        models      = ollama_client.models.list()
+        model_names = sorted([m.id for m in models.data])
+        print(f"Installed Ollama models: {model_names}")
+        return model_names
+    except Exception as ex:
+        print(f"Could not list Ollama models: {ex}")
+        return []
+
+# ---------------------------------------------------------------------------
+# Ollama model installation
+# ---------------------------------------------------------------------------
+
+def install_ollama_model(model_name):
+    """
+    Pull (download and install) an Ollama model by running:
+        ollama pull <model_name>
+
+    This is a blocking call — it waits until the download completes.
+    Model files are stored in the directory set by the OLLAMA_MODELS
+    environment variable (defaults to C:\\Users\\<user>\\.ollama\\models).
+
+    Parameters
+    ----------
+    model_name : str
+        The Ollama model identifier, e.g. "llama3.1:8b" or "mistral:latest".
+
+    Returns
+    -------
+    (True, success_message)   on success
+    (False, error_message)    on failure
+    """
+    print(f"Starting install: ollama pull {model_name}")
+    try:
+        result = subprocess.run(
+            ["ollama", "pull", model_name],
+            capture_output=True,
+            text=True,
+            timeout=3600,   # 1-hour hard timeout — large models can be slow
+        )
+        if result.returncode == 0:
+            msg = f"Model '{model_name}' installed successfully."
+            print(msg)
+            return True, msg
+        else:
+            err = result.stderr.strip() or result.stdout.strip()
+            msg = f"ollama pull failed for '{model_name}': {err}"
+            print(msg)
+            return False, msg
+    except FileNotFoundError:
+        msg = "ollama command not found. Is Ollama installed and on your PATH?"
+        print(msg)
+        return False, msg
+    except subprocess.TimeoutExpired:
+        msg = f"Install timed out after 1 hour for model '{model_name}'."
+        print(msg)
+        return False, msg
+    except Exception as ex:
+        msg = f"Unexpected error during install of '{model_name}': {ex}"
+        print(msg)
+        return False, msg
+
+# ---------------------------------------------------------------------------
+# Disk space validation
+# ---------------------------------------------------------------------------
+
+def check_disk_space(model_name):
+    """
+    Validate whether the target drive has enough free space to install a model.
+
+    Logic
+    -----
+    1. Resolve the drive to check from the OLLAMA_MODELS environment variable.
+       Falls back to the user home directory if the variable is not set or the
+       path does not exist yet.
+    2. Look up the required GB from MODEL_SIZES_GB. If the model is not in the
+       catalogue (e.g. the user typed a custom name), treat required size as 0
+       and return a warning asking the user to verify manually.
+    3. Three possible outcomes:
+       - BLOCKED  (can_install=False): free space < required size.
+                  The install cannot proceed.
+       - WARNING  (can_install=True,  warning=True): the install would fit, but
+                  the remaining free space after install would be ≤ 10 % of the
+                  total drive capacity. The user may still proceed.
+       - OK       (can_install=True,  warning=False): plenty of space.
+
+    Parameters
+    ----------
+    model_name : str  — Ollama pull name, e.g. "llama3.1:8b"
+
+    Returns
+    -------
+    dict with keys:
+        can_install      (bool)  — False blocks the install button entirely
+        warning          (bool)  — True shows a caution message but allows install
+        message          (str)   — human-readable explanation for the UI
+        required_gb      (float) — how much space the model needs
+        free_gb          (float) — current free space on the target drive
+        total_gb         (float) — total capacity of the target drive
+        remaining_pct    (float) — % of drive free AFTER the install
+    """
+    # ── 1. Resolve the drive path to inspect ──────────────────────────────
+    ollama_models_env = os.environ.get("OLLAMA_MODELS", "")
+    if ollama_models_env and os.path.exists(ollama_models_env):
+        check_path = ollama_models_env
+    else:
+        # Default Ollama storage locations
+        default_path = os.path.join(os.path.expanduser("~"), ".ollama", "models")
+        check_path   = default_path if os.path.exists(default_path) \
+                       else os.path.expanduser("~")
+
+    print(f"Disk space check path: {check_path}")
+
+    # ── 2. Get drive stats ─────────────────────────────────────────────────
+    try:
+        usage     = shutil.disk_usage(check_path)
+        total_gb  = usage.total / (1024 ** 3)
+        free_gb   = usage.free  / (1024 ** 3)
+    except Exception as ex:
+        print(f"Could not read disk usage for {check_path}: {ex}")
+        # Return a safe warning so the UI doesn't crash
+        return {
+            "can_install":   True,
+            "warning":       True,
+            "message":       f"Could not read disk space ({ex}). Verify manually before installing.",
+            "required_gb":   0.0,
+            "free_gb":       0.0,
+            "total_gb":      0.0,
+            "remaining_pct": 0.0,
+        }
+
+    # ── 3. Look up required size ───────────────────────────────────────────
+    required_gb = MODEL_SIZES_GB.get(model_name)
+    if required_gb is None:
+        print(f"Model '{model_name}' not found in MODEL_SIZES_GB — size unknown.")
+        remaining_pct = (free_gb / total_gb * 100) if total_gb > 0 else 0.0
+        return {
+            "can_install":   True,
+            "warning":       True,
+            "message":       (
+                f"Model size for '{model_name}' is unknown — it is not in the built-in catalogue. "
+                f"Current free space: {free_gb:.1f} GB. Verify the size manually before proceeding."
+            ),
+            "required_gb":   0.0,
+            "free_gb":       free_gb,
+            "total_gb":      total_gb,
+            "remaining_pct": remaining_pct,
+        }
+
+    # ── 4. Evaluate space ──────────────────────────────────────────────────
+    remaining_after_gb  = free_gb - required_gb
+    remaining_after_pct = (remaining_after_gb / total_gb * 100) if total_gb > 0 else 0.0
+
+    print(
+        f"Disk check — required: {required_gb:.1f} GB | free: {free_gb:.1f} GB | "
+        f"remaining after: {remaining_after_gb:.1f} GB ({remaining_after_pct:.1f}%)"
+    )
+
+    # BLOCKED — not enough free space
+    if free_gb < required_gb:
+        return {
+            "can_install":   False,
+            "warning":       False,
+            "message":       (
+                f"Not enough disk space to install '{model_name}'. "
+                f"Required: {required_gb:.1f} GB — Available: {free_gb:.1f} GB — "
+                f"Shortfall: {required_gb - free_gb:.1f} GB. "
+                f"Free up space on the drive and try again."
+            ),
+            "required_gb":   required_gb,
+            "free_gb":       free_gb,
+            "total_gb":      total_gb,
+            "remaining_pct": remaining_after_pct,
+        }
+
+    # WARNING — install fits but leaves ≤ 10 % free
+    if remaining_after_pct <= 10.0:
+        return {
+            "can_install":   True,
+            "warning":       True,
+            "message":       (
+                f"Low disk space warning. After installing '{model_name}' "
+                f"({required_gb:.1f} GB), only {remaining_after_pct:.1f}% "
+                f"({remaining_after_gb:.1f} GB) of the drive will remain free. "
+                f"Running with less than 10% free space may affect system performance."
+            ),
+            "required_gb":   required_gb,
+            "free_gb":       free_gb,
+            "total_gb":      total_gb,
+            "remaining_pct": remaining_after_pct,
+        }
+
+    # OK — sufficient space
+    return {
+        "can_install":   True,
+        "warning":       False,
+        "message":       (
+            f"Sufficient disk space available. "
+            f"Required: {required_gb:.1f} GB — Free: {free_gb:.1f} GB — "
+            f"Remaining after install: {remaining_after_pct:.1f}%."
+        ),
+        "required_gb":   required_gb,
+        "free_gb":       free_gb,
+        "total_gb":      total_gb,
+        "remaining_pct": remaining_after_pct,
+    }
+
+# ---------------------------------------------------------------------------
+# Ollama model uninstall
+# ---------------------------------------------------------------------------
+
+def uninstall_ollama_model(model_name):
+    """
+    Remove an installed Ollama model by running:
+        ollama rm <model_name>
+
+    The model files are deleted from the OLLAMA_MODELS directory.
+    This action is irreversible — the model must be re-downloaded to use it again.
+
+    Parameters
+    ----------
+    model_name : str  — e.g. "llama3.1:8b"
+
+    Returns
+    -------
+    (True, success_message)   on success
+    (False, error_message)    on failure
+    """
+    print(f"Uninstalling model: ollama rm {model_name}")
+    try:
+        result = subprocess.run(
+            ["ollama", "rm", model_name],
+            capture_output=True,
+            text=True,
+            timeout=120,    # removal should be fast — just deletes local files
+        )
+        if result.returncode == 0:
+            msg = f"Model '{model_name}' uninstalled successfully."
+            print(msg)
+            return True, msg
+        else:
+            err = result.stderr.strip() or result.stdout.strip()
+            msg = f"ollama rm failed for '{model_name}': {err}"
+            print(msg)
+            return False, msg
+    except FileNotFoundError:
+        msg = "ollama command not found. Is Ollama installed and on your PATH?"
+        print(msg)
+        return False, msg
+    except subprocess.TimeoutExpired:
+        msg = f"Uninstall timed out for model '{model_name}'."
+        print(msg)
+        return False, msg
+    except Exception as ex:
+        msg = f"Unexpected error during uninstall of '{model_name}': {ex}"
+        print(msg)
+        return False, msg
+    
 # ---------------------------------------------------------------------------
 # File & resource management
 # ---------------------------------------------------------------------------
