@@ -18,7 +18,7 @@ Everything runs on the user's machine — no data is sent anywhere externally.
                    │
                    ▼
 ┌─────────────────────────────────────────┐
-│        AI_Checker.py                 │
+│        AI_Checker.py                    │
 │        Streamlit UI Layer               │
 │                                         │
 │  • Ollama connection status             │
@@ -31,7 +31,7 @@ Everything runs on the user's machine — no data is sent anywhere externally.
                    │ calls
                    ▼
 ┌─────────────────────────────────────────┐
-│        backend/Functions.py          │
+│        backend/Functions.py             │
 │        Backend Logic Layer              │
 │                                         │
 │  ┌──────────────┐  ┌─────────────────┐  │
@@ -53,7 +53,7 @@ Everything runs on the user's machine — no data is sent anywhere externally.
 │        Ollama Server                    │
 │        http://localhost:11434           │
 │                                         │
-│  llama3.1:8b  │  mistral  │  qwen2.5   │
+│  llama3.1:8b  │  mistral  │  qwen2.5    │
 └─────────────────────────────────────────┘
 ```
 
