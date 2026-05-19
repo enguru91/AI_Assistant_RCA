@@ -12,6 +12,16 @@
 #              — Per-file extraction warnings surfaced after processing
 #              — Batch size indicator rendered below the uploader
 #              -> Date: 2026-05-18
+# Version: 3.3 — Fixed Export Chat button not appearing after the first LLM response
+#              — Root cause: Streamlit renders buttons top-to-bottom before LLM response
+#                is appended to chat_history; the disabled state was already stamped.
+#              — Fix: llm_response_ready session-state flag + st.rerun() after Ask AI
+#                forces a fresh render where has_history is True and the button appears.
+#              — Moved chat history rendering to a fixed location at script bottom
+#                so it is consistent on every render (no duplicate outputs).
+#              — Applied user changes: conditional Export Chat button rendering,
+#                os.startfile() to open the export folder automatically.
+#              -> Date: 2026-05-18
 #
 # Changes from v3.1:
 #   - st.file_uploader type list expanded to all 9 supported formats
@@ -28,6 +38,8 @@ from dotenv import load_dotenv
 import numpy as np
 import concurrent.futures
 import os
+import sys
+import subprocess
 import time
 
 # Import backend functions
@@ -77,6 +89,10 @@ if "confirm_uninstall"  not in st.session_state:
     st.session_state["confirm_uninstall"]  = False
 if "model_to_uninstall" not in st.session_state:
     st.session_state["model_to_uninstall"] = ""
+# Set to True after a successful LLM response so the rerun can display a
+# "Response generated." banner at the correct render position (script bottom).
+if "llm_response_ready" not in st.session_state:
+    st.session_state["llm_response_ready"] = False
 
 # ---------------------------------------------------------------------------
 # Page header
@@ -314,7 +330,7 @@ _ext_display = ", ".join(
     f".{e}" for e in sorted(ALLOWED_EXTENSIONS)
 )
 _uploader_label = (
-    f"Supported files ({_ext_display}) — "
+    f"Upload reference files ({_ext_display}) — "
     f"max {MAX_SINGLE_FILE_MB} MB per file, {MAX_BATCH_MB} MB total"
 )
 
@@ -385,20 +401,28 @@ def display_chat_history():
 
 
 def handle_timeout():
-    """Append a timeout notice and display the chat history."""
+    """
+    Append a timeout notice to chat history.
+    Chat history is rendered at the fixed location at the bottom of the script.
+    """
     st.error("4-minute LLM timeout — please rephrase your message and try again.")
     st.session_state["chat_history"].append({
         "role":    "Assistant",
         "content": "*Timeout: No response received within 4 minutes.*",
     })
-    display_chat_history()
 
 
 def handle_llm_response(response):
     """
-    Process the LLM response string.
-    Appends it to chat history and renders the updated history.
-    Shows an error if the response indicates a failure.
+    Process the LLM response string and update session state.
+
+    On success the llm_response_ready flag is set so that the script-bottom
+    rendering block can show the "Response generated." banner correctly after
+    the st.rerun() that the Ask AI button handler triggers.
+
+    Chat history rendering is intentionally NOT done here — it always happens
+    at a fixed location at the bottom of the script, which guarantees that the
+    Export Chat button state is correct on every render.
     """
     if response is None:
         handle_timeout()
@@ -408,12 +432,11 @@ def handle_llm_response(response):
         st.error(response)
         return
 
-    st.success("Response generated.")
+    st.session_state["llm_response_ready"] = True
     st.session_state["chat_history"].append({
         "role":    "Assistant",
         "content": response,
     })
-    display_chat_history()
 
 # ---------------------------------------------------------------------------
 # Core query processing
@@ -571,14 +594,34 @@ if st.session_state.get("upload_success", False):
 # ---------------------------------------------------------------------------
 
 def save_chat():
-    """Write the current chat history to a .txt file and report the path."""
+    """
+    Write the current chat history to a .txt file and open the containing
+    folder in the system file manager.
+
+    Folder-open is cross-platform:
+      Windows : os.startfile()       — native Explorer
+      macOS   : subprocess open      — native Finder
+      Linux   : subprocess xdg-open  — default file manager
+    """
     try:
         output_path = generate_output_file(st.session_state["chat_history"])
         if output_path:
             st.success(f"Chat history saved to: {output_path}")
-            folder_path = os.path.dirname(output_path)
+            folder_path          = os.path.dirname(output_path)
             absolute_folder_path = os.path.abspath(folder_path)
-            os.startfile(absolute_folder_path)
+            try:
+                if sys.platform == "win32":
+                    os.startfile(absolute_folder_path)
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", absolute_folder_path], check=False)
+                else:
+                    # Linux and other POSIX platforms
+                    subprocess.run(["xdg-open", absolute_folder_path], check=False)
+            except Exception as open_ex:
+                # Non-fatal — the file is saved; only the folder-open failed.
+                st.warning(
+                    f"File saved, but could not open the folder automatically: {open_ex}"
+                )
         else:
             st.error("Chat history is empty — nothing to export.")
     except Exception as ex:
@@ -589,7 +632,15 @@ def save_chat():
 # ---------------------------------------------------------------------------
 
 if chat_button:
+    # Reset the ready flag before each new query so the banner only appears
+    # when the current query has completed, not on every subsequent rerun.
+    st.session_state["llm_response_ready"] = False
     process_user_input()
+    # Force a fresh top-to-bottom render so that:
+    #   • has_history is re-evaluated as True → Export Chat button appears
+    #   • chat history is rendered at its fixed script-bottom location
+    #   • the "Response generated." banner appears in the right place
+    st.rerun()
 
 if print_button:
     save_chat()
@@ -601,3 +652,19 @@ if new_chat_button:
     st.info("Session cleared — ready for a new chat.")
     time.sleep(1)
     st.rerun()
+
+# ---------------------------------------------------------------------------
+# Always-on chat history rendering
+# ---------------------------------------------------------------------------
+# Rendering chat history here — after all session-state mutations — guarantees
+# that every widget above (including Export Chat) reflects the latest state.
+# This is the single authoritative place where chat output is written to the
+# page; handle_llm_response() and handle_timeout() no longer call
+# display_chat_history() themselves.
+
+if st.session_state.get("llm_response_ready"):
+    st.success("Response generated.")
+    st.session_state["llm_response_ready"] = False  # Clear so it shows once only
+
+if st.session_state["chat_history"]:
+    display_chat_history()

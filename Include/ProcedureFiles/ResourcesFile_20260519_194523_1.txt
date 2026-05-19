@@ -1,0 +1,36 @@
+[Source: JD.txt]
+
+Be handling complex queries while providing world class support to our Japan customers Primarily
+Hands-on experience with diverse networking devices like routers, switches, firewalls 
+Working experience in Firewalls and Network Security Products
+Knowledge on Linux OS is a plus 
+Troubleshoot, research and resolve issues, using labs, logs bundles and knowledge base, peer to peer collaboration and other tools you will learn in this role. 
+Partner with Engineering, Field Teams and Technical experts to resolve issues to make it easier for customers to use our technology. 
+Work directly with staff in quality assurance, engineering, sales, marketing, operations, and administration to resolve problems. 
+Updating and creating knowledge articles for global circulation and use, based on the issues you have resolved. 
+Work in an environment of on-going development, coaching, surrounded and supported by a team of highly skilled engineers and supported by a leadership team involved in and committed to your success
+
+
+On a day to day basis, you'll be responsible for a variety of initiatives, including: 
+
+
+Able to self-drive customer requirements and prioritize work 
+Function as technical point of contact for customer issues troubleshooting
+Drive communication between customer and engineering teams, providing detailed communications and instructions 
+Able to recreate customer issues in Lab.
+Able to create IN-DEPTH technical issue and resolution root cause analysis (RCA)Identify and report product issues and prioritize resolution with the engineering teams 
+Create and maintain knowledge base articles to prevent & resolve similar issues quickly 
+Weekend and public holiday coverage availability
+
+
+Requirements:
+
+
+Bachelor's Degree and 2 + years of experience 
+Enterprise Escalation and Technical support experience
+Strong knowledge of L4-L7 protocols 
+Knowledge of web technologies like HTTP/HTTPS/REST API 
+Knowledge of networking components (Routing, Switching, Firewall, TCP/IP, Endpoint Security etc.) 
+Understanding of Network Security, Firewall Concepts
+Excellent communication in Japanese, time management, and process adherence skills
+Good Communication in English
