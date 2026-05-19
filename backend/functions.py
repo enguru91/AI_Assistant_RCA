@@ -715,24 +715,39 @@ def delete_remaining_resources():
     Delete leftover ResourcesFile_, current_checksum_, and current_embeddings_
     files from previous sessions. Called once at app startup.
     """
+    for filename in os.listdir(resources_path):
+            file_path = os.path.join(resources_path, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.remove(file_path)
+                    print(f"Deleted file: {file_path}")
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+                    print(f"Deleted directory: {file_path}")
+            except Exception as ex:
+                print(f"Failed to delete {file_path}: {ex}")
+    else:
+         print(f"Directory does not exist, skipping cleanup: {resources_path}")
+
     cleanup_targets = [
-        (resources_path,  "ResourcesFile_",      ".txt"),
-        (resources_path,  "current_checksum_",   ".txt"),
+        (output_dir,      "chat_output_",        ".txt"),
         (embeddings_path, "current_embeddings_", ".pkl"),
     ]
+    
     for directory, prefix, extension in cleanup_targets:
         if not os.path.isdir(directory):
             print(f"Directory does not exist, skipping cleanup: {directory}")
             continue
         for filename in os.listdir(directory):
+            # Using endswith might be too restrictive if you just want prefix matching
+            # but keeping original logic here.
             if filename.startswith(prefix) and filename.endswith(extension):
                 file_path = os.path.join(directory, filename)
                 try:
                     os.remove(file_path)
-                    print(f"Deleted: {file_path}")
+                    print(f"Deleted targeted file: {file_path}")
                 except Exception as ex:
                     print(f"Failed to delete {file_path}: {ex}")
-
 
 def save_uploaded_files(uploaded_files) -> tuple[str | None, list[str]]:
     """
@@ -824,7 +839,6 @@ def save_uploaded_files(uploaded_files) -> tuple[str | None, list[str]]:
 
     return new_checksum, warnings
 
-
 def compute_resources_checksum(directory: str) -> str | None:
     """
     Compute an MD5 hash across all ResourcesFile_ .txt files in the directory.
@@ -843,7 +857,6 @@ def compute_resources_checksum(directory: str) -> str | None:
         print("No ResourcesFile_ files found for checksum computation.")
         return None
     return hash_md5.hexdigest()
-
 
 def check_exists_checksum_file(directory: str) -> str | None:
     """
